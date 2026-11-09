@@ -1,0 +1,11 @@
+id: org.miniopensource.miniclassisland.extendmanagement
+name: MINI ClassIsland 集控增强组件
+description: "【安全风险警告】本插件包含极高系统与终端控制权限（含硬件采集、设置与多档案运行时变更、插件自我保护、应用抗停止，以及受控开启的代码执行、屏幕截图、模拟点击与进程读取能力），仅限在完全信任集控管理员的设备上安装。为 MINI ClassIsland 集控服务器提供增强集控与远程运维支持。"
+entranceAssembly: "MiniClassIsland.ExtendManagement.dll"
+url: https://github.com/miniclassisland/plugin
+version: 2.0.0.1
+apiVersion: 2.0.0.0
+author: MINI OpenSource
+icon: icon.png
+readme: README.md
+restartRequired: true
