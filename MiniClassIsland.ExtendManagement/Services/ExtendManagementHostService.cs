@@ -357,7 +357,7 @@ public sealed class ExtendManagementHostService(
 
             await roamingCoordinator.ReportHookSnapshotAsync(new
             {
-                extend_management_version = "2.0.0.3",
+                extend_management_version = "2.0.0.4",
                 is_app_locked = appLockService.IsEffectiveAppLocked,
                 plugin_settings = settingsCatalog,
                 plugin_components = registeredComponents,
@@ -447,7 +447,8 @@ public sealed class ExtendManagementHostService(
 
     private async Task<JsonElement> DispatchActionAsync(string action, JsonElement payload)
     {
-        if (action.StartsWith("hardware.", StringComparison.Ordinal))
+        if (action.StartsWith("hardware.", StringComparison.Ordinal) ||
+            action is "system.hardware_info" or "system.hardware")
         {
             return await hardwareHandler.ExecuteAsync(action, payload);
         }
@@ -492,7 +493,7 @@ public sealed class ExtendManagementHostService(
             {
                 extendManagementEnabled = true,
                 pluginId = SelfProtectionService.PluginId,
-                version = "2.0.0.3",
+                version = "2.0.0.4",
                 serverFlavor = HostRuntimeBridge.GetMiniServerDisplayKind(managementService),
                 isAppLocked = appLockService.IsEffectiveAppLocked,
                 features = new[]
@@ -594,7 +595,7 @@ public sealed class ExtendManagementHostService(
 
             var metadata = getMetadataMethod?.Invoke(conn, [false]) as Grpc.Core.Metadata ?? [];
             metadata.Add("x-extend-management-enabled", "1");
-            metadata.Add("x-extend-management-version", "2.0.0.3");
+            metadata.Add("x-extend-management-version", "2.0.0.4");
             var payloadJson = JsonSerializer.Serialize(response);
 
             var uploadClient = new ConfigUpload.ConfigUploadClient(channel);

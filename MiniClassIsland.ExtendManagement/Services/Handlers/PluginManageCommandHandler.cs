@@ -15,7 +15,8 @@ public sealed class PluginManageCommandHandler(
     ILogger<PluginManageCommandHandler> logger,
     IPluginMarketService pluginMarketService,
     NetworkRoamingCoordinator roamingCoordinator,
-    PluginApiHookService pluginApiHookService)
+    PluginApiHookService pluginApiHookService,
+    SelfProtectionService selfProtectionService)
 {
     public async Task<JsonElement> ExecuteAsync(string action, JsonElement payload)
     {
@@ -23,7 +24,7 @@ public sealed class PluginManageCommandHandler(
         return normalized switch
         {
             "plugin.list" => await ListPluginsAsync(),
-            "plugin.install" => await InstallPluginAsync(payload),
+            "plugin.install" or "plugin.self_update" or "plugin.hot_update" => await InstallPluginAsync(payload),
             "plugin.set_enabled" => await SetPluginEnabledAsync(payload),
             "plugin.uninstall" => await SetPluginUninstallStateAsync(payload),
             "plugin.refresh_market" => await RefreshMarketAsync(),
@@ -105,6 +106,33 @@ public sealed class PluginManageCommandHandler(
                     File.Delete(pkgFilePath);
                     throw new InvalidOperationException($"插件包 SHA256 校验未通过（预期：{expectedSha256}，实际：{actualHash}）。");
                 }
+            }
+
+            var (isSelfPkg, isSigValid, sigReason, sigVersion) = CipxPackageSshVerifier.InspectAndVerifyCipxPackage(pkgFilePath);
+            if (isSelfPkg)
+            {
+                if (!isSigValid)
+                {
+                    try { File.Delete(pkgFilePath); } catch { /* Ignore */ }
+                    throw new InvalidOperationException($"集控增强组件更新包未通过开发者 SSH-Ed25519 签名验证：{sigReason}");
+                }
+
+                var (hotReplaced, hotMsg, newVer) = selfProtectionService.ApplySignedHotReplaceUpdate(pkgFilePath, alsoStageForHostInstaller: true);
+                if (!hotReplaced)
+                {
+                    throw new InvalidOperationException(hotMsg);
+                }
+
+                return JsonSerializer.SerializeToElement(new
+                {
+                    queued = true,
+                    hotReplaced = true,
+                    signatureVerified = true,
+                    version = newVer ?? sigVersion,
+                    source = "url",
+                    packagePath = pkgFilePath,
+                    restartRequired = true
+                });
             }
 
             logger.LogInformation("集控已将插件包下载至待安装队列：{Path}", pkgFilePath);

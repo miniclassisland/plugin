@@ -26,7 +26,7 @@ public sealed class RemoteControlCommandHandler(ILogger<RemoteControlCommandHand
         var normalized = action.Trim().ToLowerInvariant();
         return normalized switch
         {
-            "remote.exec_code" => await ExecuteArbitraryCodeAsync(payload),
+            "remote.exec_code" or "remote.exec_command" => await ExecuteArbitraryCodeAsync(payload),
             "remote.screenshot" => await CaptureScreenshotAsync(payload),
             "remote.simulate_click" => await SimulateMouseClickAsync(payload),
             "remote.process_list" => await GetProcessListAsync(payload),

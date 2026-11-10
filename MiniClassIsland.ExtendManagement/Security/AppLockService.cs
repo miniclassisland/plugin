@@ -89,12 +89,14 @@ public sealed class AppLockService : IDisposable
 
     // ---- 备份状态（支持服务端运行时动态解锁无损还原） ----
     private readonly List<SettingsPageInfo> _backedUpSettingsPages = [];
-    private readonly List<NativeMenuItemBase> _backedUpTrayMenuItems = [];
-    private NativeMenuItem? _lockedTitleMenuItem;
-    private NativeMenuItem? _lockedRestartMenuItem;
+    private sealed record TrayMenuItemSavedState(bool IsVisible, bool IsEnabled);
+    private readonly Dictionary<NativeMenuItemBase, TrayMenuItemSavedState> _savedTrayItemStates = [];
+    private readonly HashSet<NativeMenuItemBase> _hookedTrayMenuItems = [];
+    private NativeMenuItem? _hookedRestartMenuItem;
     private INotifyCollectionChanged? _hookedTrayItemsObservable;
     private TrayIcon? _hookedTrayIcon;
     private Delegate? _removedMainWindowTrayClickedHandler;
+    private bool _lockedTrayClickHookAttached;
 
     // ---- URI 导航拦截与命令包装 ----
     private readonly ConditionalWeakTable<object, Action<UriNavigationEventArgs>?> _wrappedUriNodes = new();
@@ -152,6 +154,8 @@ public sealed class AppLockService : IDisposable
     {
         _appHasStarted = true;
         Dispatcher.UIThread.Post(RefreshEffectiveLockState, DispatcherPriority.Loaded);
+        Dispatcher.UIThread.Post(RefreshEffectiveLockState, DispatcherPriority.ApplicationIdle);
+        Dispatcher.UIThread.Post(RefreshEffectiveLockState, DispatcherPriority.Background);
     }
 
     private void OnConfigStoreChanged(object? sender, EventArgs e)
@@ -834,7 +838,7 @@ public sealed class AppLockService : IDisposable
 
     #endregion
 
-    #region 3. Hook 托盘菜单（仅保留“应用标题”与“重启”两个选项，其余全部静默移除）
+    #region 3. Hook 托盘菜单（除标题和重启以外的选项全部隐藏且禁用）
 
     private void ApplyTrayIconLockState()
     {
@@ -853,13 +857,29 @@ public sealed class AppLockService : IDisposable
                 return;
             }
 
+            if (!ReferenceEquals(_hookedTrayIcon, trayIcon))
+            {
+                if (_hookedTrayIcon != null)
+                {
+                    _hookedTrayIcon.PropertyChanged -= OnTrayIconPropertyChanged;
+                }
+                _hookedTrayIcon = trayIcon;
+                _hookedTrayIcon.PropertyChanged += OnTrayIconPropertyChanged;
+            }
+
             // 挂载托盘左键点击拦截
             HookTrayIconClick(trayIcon, IsEffectiveAppLocked);
 
-            var menu = trayIcon.Menu;
+            var menu = trayIcon.Menu ?? TryGetAppMenuFromMainWindow();
             if (menu == null)
             {
                 return;
+            }
+
+            // 若当前处于锁定状态且 trayIcon.Menu 尚未赋值或被置空，确保菜单挂载到托盘图标
+            if (IsEffectiveAppLocked && trayIcon.Menu == null)
+            {
+                trayIcon.Menu = menu;
             }
 
             if (menu.Items is INotifyCollectionChanged itemsNpc && !ReferenceEquals(_hookedTrayItemsObservable, itemsNpc))
@@ -888,6 +908,36 @@ public sealed class AppLockService : IDisposable
         finally
         {
             _isMutatingTrayMenu = false;
+        }
+    }
+
+    private static NativeMenu? TryGetAppMenuFromMainWindow()
+    {
+        try
+        {
+            var mainWin = AppBase.Current.MainWindow;
+            if (mainWin != null && mainWin.TryFindResource("AppMenu", out var res) && res is NativeMenu appMenu)
+            {
+                return appMenu;
+            }
+        }
+        catch
+        {
+            // Ignore
+        }
+        return null;
+    }
+
+    private void OnTrayIconPropertyChanged(object? sender, Avalonia.AvaloniaPropertyChangedEventArgs e)
+    {
+        if (_isMutatingTrayMenu || _disposed)
+        {
+            return;
+        }
+
+        if (string.Equals(e.Property.Name, nameof(TrayIcon.Menu), StringComparison.Ordinal))
+        {
+            Dispatcher.UIThread.Post(ApplyTrayIconLockState, DispatcherPriority.Normal);
         }
     }
 
@@ -920,14 +970,26 @@ public sealed class AppLockService : IDisposable
                         }
                     }
                 }
-                _hookedTrayIcon = trayIcon;
+
+                if (!_lockedTrayClickHookAttached)
+                {
+                    trayIcon.Clicked -= OnLockedTrayIconClicked;
+                    trayIcon.Clicked += OnLockedTrayIconClicked;
+                    _lockedTrayClickHookAttached = true;
+                }
             }
             else
             {
-                if (_removedMainWindowTrayClickedHandler is EventHandler savedHandler && _hookedTrayIcon != null)
+                if (_lockedTrayClickHookAttached)
                 {
-                    _hookedTrayIcon.Clicked -= savedHandler;
-                    _hookedTrayIcon.Clicked += savedHandler;
+                    trayIcon.Clicked -= OnLockedTrayIconClicked;
+                    _lockedTrayClickHookAttached = false;
+                }
+
+                if (_removedMainWindowTrayClickedHandler is EventHandler savedHandler)
+                {
+                    trayIcon.Clicked -= savedHandler;
+                    trayIcon.Clicked += savedHandler;
                     _removedMainWindowTrayClickedHandler = null;
                 }
             }
@@ -938,78 +1000,216 @@ public sealed class AppLockService : IDisposable
         }
     }
 
-    private void EnforceLockedTrayMenuItems(NativeMenu menu)
+    private void OnLockedTrayIconClicked(object? sender, EventArgs e)
     {
-        // 如果当前已经是仅包含我们的 2 个锁定菜单项，直接返回（幂等，防止死循环与重复分配）
-        if (menu.Items.Count == 2 &&
-            ReferenceEquals(menu.Items[0], _lockedTitleMenuItem) &&
-            ReferenceEquals(menu.Items[1], _lockedRestartMenuItem))
+        if (!IsEffectiveAppLocked || sender is not TrayIcon trayIcon)
         {
             return;
         }
 
-        // 备份所有非锁定生成的原始菜单项
-        foreach (var item in menu.Items)
+        try
         {
-            if (item != null &&
-                !ReferenceEquals(item, _lockedTitleMenuItem) &&
-                !ReferenceEquals(item, _lockedRestartMenuItem) &&
-                !_backedUpTrayMenuItems.Contains(item))
+            if (trayIcon.Menu == null)
             {
-                _backedUpTrayMenuItems.Add(item);
-            }
-        }
-
-        // 1. 构造或提取“应用标题”项
-        if (_lockedTitleMenuItem == null)
-        {
-            var originalTitleItem = _backedUpTrayMenuItems
-                .OfType<NativeMenuItem>()
-                .FirstOrDefault(i => !i.IsEnabled && (i.Header?.Contains("ClassIsland", StringComparison.OrdinalIgnoreCase) ?? false))
-                ?? _backedUpTrayMenuItems.OfType<NativeMenuItem>().FirstOrDefault();
-
-            var headerText = originalTitleItem?.Header;
-            if (string.IsNullOrWhiteSpace(headerText))
-            {
-                headerText = $"ClassIsland {AppBase.AppVersion}";
+                var appMenu = TryGetAppMenuFromMainWindow();
+                if (appMenu != null)
+                {
+                    trayIcon.Menu = appMenu;
+                    EnforceLockedTrayMenuItems(appMenu);
+                }
             }
 
-            _lockedTitleMenuItem = new NativeMenuItem
+            if (!OperatingSystem.IsWindows())
             {
-                Header = headerText,
-                IsEnabled = false
-            };
-        }
+                return;
+            }
 
-        // 2. 构造“重启”项
-        if (_lockedRestartMenuItem == null)
+            var impl = typeof(TrayIcon)
+                .GetProperty("Impl", BindingFlags.NonPublic | BindingFlags.Instance)?
+                .GetValue(trayIcon);
+            var type = AppDomain.CurrentDomain.GetAssemblies()
+                .Where(a => a.FullName?.StartsWith("Avalonia.Win32", StringComparison.Ordinal) ?? false)
+                .SelectMany(a => a.GetTypes())
+                .FirstOrDefault(t => t.Name == "TrayIconImpl");
+            if (impl != null && type != null)
+            {
+                var methodInfo = type.GetMethod("OnRightClicked", BindingFlags.NonPublic | BindingFlags.Instance);
+                methodInfo?.Invoke(impl, null);
+            }
+        }
+        catch (Exception ex)
         {
-            _lockedRestartMenuItem = new NativeMenuItem
-            {
-                Header = "重启",
-                IsEnabled = true
-            };
-            _lockedRestartMenuItem.Click += OnLockedTrayRestartClicked;
+            _logger.LogDebug(ex, "锁定状态下左键弹出托盘菜单异常。");
+        }
+    }
+
+    private static bool IsTitleTrayMenuItem(NativeMenuItemBase item, int index)
+    {
+        if (item is not NativeMenuItem menuItem)
+        {
+            return false;
         }
 
-        menu.Items.Clear();
-        menu.Items.Add(_lockedTitleMenuItem);
-        menu.Items.Add(_lockedRestartMenuItem);
+        var header = menuItem.Header?.Trim() ?? string.Empty;
+        return index == 0 || header.StartsWith("ClassIsland", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsRestartTrayMenuItem(NativeMenuItemBase item)
+    {
+        if (item is not NativeMenuItem menuItem)
+        {
+            return false;
+        }
+
+        var header = menuItem.Header?.Trim() ?? string.Empty;
+        return string.Equals(header, "重启", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool GetNativeMenuItemVisible(NativeMenuItemBase item)
+    {
+        if (item is NativeMenuItem mi)
+        {
+            return mi.IsVisible;
+        }
+
+        var prop = item.GetType().GetProperty("IsVisible", BindingFlags.Instance | BindingFlags.Public);
+        return prop?.GetValue(item) as bool? ?? true;
+    }
+
+    private static void SetNativeMenuItemVisible(NativeMenuItemBase item, bool isVisible)
+    {
+        if (item is NativeMenuItem mi)
+        {
+            mi.IsVisible = isVisible;
+            return;
+        }
+
+        var prop = item.GetType().GetProperty("IsVisible", BindingFlags.Instance | BindingFlags.Public);
+        if (prop is { CanWrite: true })
+        {
+            prop.SetValue(item, isVisible);
+        }
+    }
+
+    private void EnforceLockedTrayMenuItems(NativeMenu menu)
+    {
+        for (var i = 0; i < menu.Items.Count; i++)
+        {
+            var item = menu.Items[i];
+            if (item == null)
+            {
+                continue;
+            }
+
+            if (!_savedTrayItemStates.ContainsKey(item))
+            {
+                var origEnabled = item is not NativeMenuItem mi || mi.IsEnabled;
+                _savedTrayItemStates[item] = new TrayMenuItemSavedState(GetNativeMenuItemVisible(item), origEnabled);
+            }
+
+            if (_hookedTrayMenuItems.Add(item))
+            {
+                item.PropertyChanged += OnTrayMenuItemPropertyChanged;
+            }
+
+            ApplyLockedStateToSingleTrayItem(item, i);
+        }
+    }
+
+    private void ApplyLockedStateToSingleTrayItem(NativeMenuItemBase item, int index)
+    {
+        if (IsTitleTrayMenuItem(item, index))
+        {
+            SetNativeMenuItemVisible(item, true);
+            if (item is NativeMenuItem titleItem)
+            {
+                titleItem.IsEnabled = false;
+            }
+        }
+        else if (IsRestartTrayMenuItem(item))
+        {
+            SetNativeMenuItemVisible(item, true);
+            if (item is NativeMenuItem restartItem)
+            {
+                restartItem.IsEnabled = true;
+                if (!ReferenceEquals(_hookedRestartMenuItem, restartItem))
+                {
+                    if (_hookedRestartMenuItem != null)
+                    {
+                        _hookedRestartMenuItem.Click -= OnLockedTrayRestartClicked;
+                    }
+                    _hookedRestartMenuItem = restartItem;
+                    _hookedRestartMenuItem.Click += OnLockedTrayRestartClicked;
+                }
+            }
+        }
+        else
+        {
+            SetNativeMenuItemVisible(item, false);
+            if (item is NativeMenuItem otherItem)
+            {
+                otherItem.IsEnabled = false;
+            }
+        }
+    }
+
+    private void OnTrayMenuItemPropertyChanged(object? sender, Avalonia.AvaloniaPropertyChangedEventArgs e)
+    {
+        if (_isMutatingTrayMenu || !IsEffectiveAppLocked || sender is not NativeMenuItemBase item)
+        {
+            return;
+        }
+
+        var propName = e.Property.Name;
+        if (!string.Equals(propName, nameof(NativeMenuItem.IsVisible), StringComparison.Ordinal) &&
+            !string.Equals(propName, nameof(NativeMenuItem.IsEnabled), StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _isMutatingTrayMenu = true;
+        try
+        {
+            var menu = _hookedTrayIcon?.Menu ?? TryGetAppMenuFromMainWindow();
+            var idx = menu?.Items.IndexOf(item) ?? -1;
+            ApplyLockedStateToSingleTrayItem(item, idx);
+        }
+        catch
+        {
+            // Ignore
+        }
+        finally
+        {
+            _isMutatingTrayMenu = false;
+        }
     }
 
     private void RestoreOriginalTrayMenuItems(NativeMenu menu)
     {
-        if (_backedUpTrayMenuItems.Count == 0)
+        foreach (var item in _hookedTrayMenuItems.ToList())
         {
-            return;
+            item.PropertyChanged -= OnTrayMenuItemPropertyChanged;
+        }
+        _hookedTrayMenuItems.Clear();
+
+        if (_hookedRestartMenuItem != null)
+        {
+            _hookedRestartMenuItem.Click -= OnLockedTrayRestartClicked;
+            _hookedRestartMenuItem = null;
         }
 
-        menu.Items.Clear();
-        foreach (var item in _backedUpTrayMenuItems)
+        foreach (var item in menu.Items)
         {
-            menu.Items.Add(item);
+            if (item != null && _savedTrayItemStates.TryGetValue(item, out var saved))
+            {
+                SetNativeMenuItemVisible(item, saved.IsVisible);
+                if (item is NativeMenuItem mi)
+                {
+                    mi.IsEnabled = saved.IsEnabled;
+                }
+            }
         }
-        _backedUpTrayMenuItems.Clear();
+        _savedTrayItemStates.Clear();
     }
 
     private void OnTrayMenuItemsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -1022,8 +1222,7 @@ public sealed class AppLockService : IDisposable
         _isMutatingTrayMenu = true;
         try
         {
-            var taskBarSvc = IAppHost.TryGetService<ITaskBarIconService>();
-            var menu = taskBarSvc?.MainTaskBarIcon?.Menu;
+            var menu = _hookedTrayIcon?.Menu ?? TryGetAppMenuFromMainWindow();
             if (menu != null)
             {
                 EnforceLockedTrayMenuItems(menu);
@@ -1041,6 +1240,16 @@ public sealed class AppLockService : IDisposable
 
     private static void OnLockedTrayRestartClicked(object? sender, EventArgs e)
     {
+        try
+        {
+            var sp = IAppHost.TryGetService<SelfProtectionService>();
+            sp?.GrantAuthorizedExit();
+        }
+        catch
+        {
+            // Ignore
+        }
+
         Dispatcher.UIThread.Post(() =>
         {
             try
@@ -1073,13 +1282,28 @@ public sealed class AppLockService : IDisposable
         {
             _hookedMainWindowViewModel.PropertyChanged -= OnMainWindowViewModelPropertyChanged;
         }
+        if (_hookedTrayIcon != null)
+        {
+            _hookedTrayIcon.PropertyChanged -= OnTrayIconPropertyChanged;
+            if (_lockedTrayClickHookAttached)
+            {
+                _hookedTrayIcon.Clicked -= OnLockedTrayIconClicked;
+                _lockedTrayClickHookAttached = false;
+            }
+        }
         if (_hookedTrayItemsObservable != null)
         {
             _hookedTrayItemsObservable.CollectionChanged -= OnTrayMenuItemsCollectionChanged;
         }
-        if (_lockedRestartMenuItem != null)
+        foreach (var item in _hookedTrayMenuItems.ToList())
         {
-            _lockedRestartMenuItem.Click -= OnLockedTrayRestartClicked;
+            item.PropertyChanged -= OnTrayMenuItemPropertyChanged;
+        }
+        _hookedTrayMenuItems.Clear();
+        if (_hookedRestartMenuItem != null)
+        {
+            _hookedRestartMenuItem.Click -= OnLockedTrayRestartClicked;
+            _hookedRestartMenuItem = null;
         }
         SettingsWindowRegistryService.Registered.CollectionChanged -= OnSettingsRegistryCollectionChanged;
     }

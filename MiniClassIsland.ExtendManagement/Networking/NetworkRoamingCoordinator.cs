@@ -366,7 +366,7 @@ public sealed class NetworkRoamingCoordinator : IDisposable
             request.Headers.TryAddWithoutValidation("x-client-mac", mac);
         }
         request.Headers.TryAddWithoutValidation("x-extend-management-enabled", "1");
-        request.Headers.TryAddWithoutValidation("x-extend-management-version", "2.0.0.3");
+        request.Headers.TryAddWithoutValidation("x-extend-management-version", "2.0.0.4");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 

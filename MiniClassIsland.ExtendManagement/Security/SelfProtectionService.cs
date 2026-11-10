@@ -41,10 +41,13 @@ public sealed class SelfProtectionService : IDisposable
     private readonly List<FileStream> _lockedStreams = [];
     private readonly Dictionary<string, byte[]> _pluginFileMirrors = new(StringComparer.OrdinalIgnoreCase);
     private FileSystemWatcher? _pluginFolderWatcher;
+    private FileSystemWatcher? _packagesStagingWatcher;
     private readonly Timer _guardTimer;
     private bool _authorizedSelfUninstallRequested;
+    private bool _authorizedSignedSelfUpdatePending;
 
     public bool IsSelfUninstallPending => _authorizedSelfUninstallRequested;
+    public bool IsSignedSelfUpdatePending => _authorizedSignedSelfUpdatePending;
 
     public SelfProtectionService(
         ILogger<SelfProtectionService> logger,
@@ -175,8 +178,20 @@ public sealed class SelfProtectionService : IDisposable
             foreach (var file in Directory.GetFiles(_pluginFolderPath, "*", SearchOption.AllDirectories))
             {
                 var fileName = Path.GetFileName(file);
-                if (fileName is ".disabled" or ".uninstall")
+                if (fileName is ".disabled" or ".uninstall" or ".old" || fileName.EndsWith(".old", StringComparison.OrdinalIgnoreCase))
                 {
+                    if (fileName.EndsWith(".old", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            File.SetAttributes(file, FileAttributes.Normal);
+                            File.Delete(file);
+                        }
+                        catch
+                        {
+                            // Ignore
+                        }
+                    }
                     continue;
                 }
                 try
@@ -223,6 +238,19 @@ public sealed class SelfProtectionService : IDisposable
             _pluginFolderWatcher.Created += OnPluginDirectoryFileChanged;
             _pluginFolderWatcher.Changed += OnPluginDirectoryFileChanged;
             _pluginFolderWatcher.Renamed += OnPluginDirectoryFileChanged;
+
+            InitializePackagesStagingGuard();
+
+            var (installedSigOk, installedSigReason, installedSigVer) =
+                CipxPackageSshVerifier.VerifyInstalledPluginDirectory(_pluginFolderPath);
+            if (installedSigOk)
+            {
+                _logger.LogInformation("插件本体 SSH-Ed25519 数字签名校验通过（版本：{Version}）。", installedSigVer);
+            }
+            else
+            {
+                _logger.LogDebug("当前插件安装目录签名状态：{Reason}", installedSigReason);
+            }
 
             AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
             Window.WindowOpenedEvent.AddClassHandler<Window>(OnWindowOpenedForPluginGuard);
@@ -398,6 +426,8 @@ public sealed class SelfProtectionService : IDisposable
             Path.Combine(_pluginFolderPath, "MiniClassIsland.ExtendManagement.dll"),
             Path.Combine(_pluginFolderPath, "manifest.yml"),
             Path.Combine(_pluginFolderPath, "icon.png"),
+            Path.Combine(_pluginFolderPath, CipxPackageSshVerifier.SignatureManifestEntryName),
+            Path.Combine(_pluginFolderPath, CipxPackageSshVerifier.SignatureSshSigEntryName),
             Path.Combine(_pluginFolderPath, TamperEvidentConfigStore.SecurityAcceptedMarkerFileName)
         };
 
@@ -475,10 +505,214 @@ public sealed class SelfProtectionService : IDisposable
         }, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
     }
 
+    private void InitializePackagesStagingGuard()
+    {
+        try
+        {
+            var pkgDir = HostRuntimeBridge.PluginsPkgRootPath;
+            Directory.CreateDirectory(pkgDir);
+
+            VerifyAndPurgeTamperedStagedPackages();
+
+            _packagesStagingWatcher = new FileSystemWatcher(pkgDir, "*.cipx")
+            {
+                IncludeSubdirectories = false,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.CreationTime | NotifyFilters.LastWrite | NotifyFilters.Size,
+                EnableRaisingEvents = true
+            };
+            _packagesStagingWatcher.Created += OnPackagesStagingChanged;
+            _packagesStagingWatcher.Changed += OnPackagesStagingChanged;
+            _packagesStagingWatcher.Renamed += OnPackagesStagingChanged;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "初始化插件安装暂存目录签名守卫时发生异常。");
+        }
+    }
+
+    private void OnPackagesStagingChanged(object sender, FileSystemEventArgs e)
+    {
+        VerifyAndPurgeTamperedStagedPackages();
+    }
+
+    /// <summary>
+    /// 扫描插件安装暂存目录（Cache/PluginPackages/*.cipx），拦截任何试图通过插件市场安装服务或“从文件安装”服务覆盖本插件但未携带合法开发者 SSH-Ed25519 签名的包；
+    /// 若检测到通过开发者 SSH-Ed25519 签名的正版更新包，则自动标记允许热替换更新并在退出时释放旧文件句柄。
+    /// </summary>
+    public void VerifyAndPurgeTamperedStagedPackages()
+    {
+        try
+        {
+            var pkgDir = HostRuntimeBridge.PluginsPkgRootPath;
+            if (!Directory.Exists(pkgDir))
+            {
+                return;
+            }
+
+            foreach (var cipxFile in Directory.GetFiles(pkgDir, "*.cipx", SearchOption.TopDirectoryOnly))
+            {
+                var (isSelfPkg, isSigValid, reason, version) = CipxPackageSshVerifier.InspectAndVerifyCipxPackage(cipxFile);
+                if (!isSelfPkg)
+                {
+                    continue;
+                }
+
+                if (isSigValid)
+                {
+                    if (!_authorizedSignedSelfUpdatePending)
+                    {
+                        _authorizedSignedSelfUpdatePending = true;
+                        _logger.LogInformation(
+                            "插件更新保护：检测到经过开发者 SSH-Ed25519 签名认证的正版更新包 ({File}, 版本={Version})，已授权热替换更新。",
+                            Path.GetFileName(cipxFile),
+                            version ?? "unknown");
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        File.SetAttributes(cipxFile, FileAttributes.Normal);
+                        File.Delete(cipxFile);
+                        _logger.LogWarning(
+                            "插件更新保护：已拦截并删除未通过开发者 SSH-Ed25519 签名校验的覆盖安装包 [{File}]，原因：{Reason}",
+                            Path.GetFileName(cipxFile),
+                            reason);
+                    }
+                    catch (Exception delEx)
+                    {
+                        _logger.LogDebug(delEx, "删除未授权覆盖安装包 {File} 失败。", cipxFile);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "巡检插件安装暂存区签名时发生异常。");
+        }
+    }
+
+    /// <summary>
+    /// 对外部或远程传入的本插件更新包执行 SSH-Ed25519 签名校验并执行就地原子热替换（将旧版 DLL 重命名为 .old 供进程退出清理，立即写入新版文件）。
+    /// </summary>
+    public (bool Success, string Message, string? Version) ApplySignedHotReplaceUpdate(string signedCipxFilePath, bool alsoStageForHostInstaller = true)
+    {
+        var (isSelfPkg, isSigValid, reason, version) = CipxPackageSshVerifier.InspectAndVerifyCipxPackage(signedCipxFilePath);
+        if (!isSelfPkg)
+        {
+            return (false, "目标 .cipx 包不是 MINI ClassIsland 集控增强组件安装包。", null);
+        }
+
+        if (!isSigValid)
+        {
+            try
+            {
+                if (File.Exists(signedCipxFilePath))
+                {
+                    File.Delete(signedCipxFilePath);
+                }
+            }
+            catch
+            {
+                // Ignore
+            }
+            return (false, $"拒绝热替换更新：{reason}", version);
+        }
+
+        try
+        {
+            _authorizedSignedSelfUpdatePending = true;
+            ReleaseFileLocks();
+
+            if (!string.IsNullOrWhiteSpace(_pluginFolderPath) && Directory.Exists(_pluginFolderPath))
+            {
+                // 清理旧的 .old 残留文件
+                foreach (var oldFile in Directory.GetFiles(_pluginFolderPath, "*.old", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        File.SetAttributes(oldFile, FileAttributes.Normal);
+                        File.Delete(oldFile);
+                    }
+                    catch
+                    {
+                        // Ignore
+                    }
+                }
+
+                using var fs = new FileStream(signedCipxFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var archive = new System.IO.Compression.ZipArchive(fs, System.IO.Compression.ZipArchiveMode.Read);
+
+                foreach (var entry in archive.Entries)
+                {
+                    if (string.IsNullOrEmpty(entry.Name) && entry.FullName.EndsWith('/'))
+                    {
+                        continue;
+                    }
+
+                    var targetPath = Path.Combine(_pluginFolderPath, entry.FullName.Replace('/', Path.DirectorySeparatorChar));
+                    var targetDir = Path.GetDirectoryName(targetPath);
+                    if (!string.IsNullOrWhiteSpace(targetDir))
+                    {
+                        Directory.CreateDirectory(targetDir);
+                    }
+
+                    using var entryStream = entry.Open();
+                    using var ms = new MemoryStream();
+                    entryStream.CopyTo(ms);
+                    var newBytes = ms.ToArray();
+
+                    // 如果目标文件正在被 CLR 映射占用（如 .dll），Windows 允许在运行时将其 Move 重命名为 .old，然后再创建同名新文件！
+                    if (File.Exists(targetPath))
+                    {
+                        try
+                        {
+                            File.SetAttributes(targetPath, FileAttributes.Normal);
+                            File.WriteAllBytes(targetPath, newBytes);
+                        }
+                        catch
+                        {
+                            var backupOldPath = $"{targetPath}.{Guid.NewGuid():N}.old";
+                            File.Move(targetPath, backupOldPath, overwrite: true);
+                            File.WriteAllBytes(targetPath, newBytes);
+                        }
+                    }
+                    else
+                    {
+                        File.WriteAllBytes(targetPath, newBytes);
+                    }
+
+                    _pluginFileMirrors[targetPath] = newBytes;
+                }
+            }
+
+            if (alsoStageForHostInstaller)
+            {
+                Directory.CreateDirectory(HostRuntimeBridge.PluginsPkgRootPath);
+                var stagedPath = Path.Combine(HostRuntimeBridge.PluginsPkgRootPath, $"{PluginId}.cipx");
+                if (!string.Equals(Path.GetFullPath(signedCipxFilePath), Path.GetFullPath(stagedPath), StringComparison.OrdinalIgnoreCase))
+                {
+                    File.Copy(signedCipxFilePath, stagedPath, overwrite: true);
+                }
+            }
+
+            AcquireFileLocks();
+            _logger.LogInformation("已完成经 SSH-Ed25519 签名验证的插件本体热替换更新（版本：{Version}）。", version);
+            return (true, "SSH-Ed25519 签名验证通过，已完成插件本体热替换更新。", version);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "执行签名插件热替换更新失败。");
+            AcquireFileLocks();
+            return (false, $"执行热替换更新异常：{ex.Message}", version);
+        }
+    }
+
     private void OnProcessExit(object? sender, EventArgs e)
     {
         ReleaseFileLocks();
-        if (!_authorizedSelfUninstallRequested)
+        VerifyAndPurgeTamperedStagedPackages();
+        if (!_authorizedSelfUninstallRequested && !_authorizedSignedSelfUpdatePending)
         {
             RemoveDisableAndUninstallMarkers();
             HealPluginFilesIfMissing();
@@ -493,11 +727,15 @@ public sealed class SelfProtectionService : IDisposable
         }
 
         _configStore.VerifyAndHealDiskFile();
+        VerifyAndPurgeTamperedStagedPackages();
 
         if (!_authorizedSelfUninstallRequested)
         {
             RemoveDisableAndUninstallMarkers();
-            HealPluginFilesIfMissing();
+            if (!_authorizedSignedSelfUpdatePending)
+            {
+                HealPluginFilesIfMissing();
+            }
         }
     }
 
@@ -505,6 +743,7 @@ public sealed class SelfProtectionService : IDisposable
     {
         _guardTimer.Dispose();
         _pluginFolderWatcher?.Dispose();
+        _packagesStagingWatcher?.Dispose();
         ReleaseFileLocks();
     }
 }
