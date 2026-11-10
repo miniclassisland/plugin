@@ -1,7 +1,6 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -24,16 +23,12 @@ using MiniClassIsland.ExtendManagement.Services;
 namespace MiniClassIsland.ExtendManagement.Security;
 
 /// <summary>
-/// 插件自我保护、MINI 集控隐藏与应用本体抗停止服务（免杀与高可靠重构版）：
-/// 1. 彻底移除易触发卡巴斯基/Defender PDM 行为查杀的底层特征（不再修改内核 DACL `SetKernelObjectSecurity`、不再后台拉起隐藏的 `powershell.exe -EncodedCommand`）；
-/// 2. 插件自我保护：
-///    - 对插件核心文件持有只读共享文件句柄锁并保存内存镜像，防止外部删除或覆盖；
-///    - 毫秒级清除 `.disabled` 与 `.uninstall` 标记，并同步重置内存中的 `PluginInfo.RestartRequired` / `IsEnabled` / `IsUninstalling`；
-///    - 在设置窗口（`PluginsSettingsPage`）视觉树中，当选择本插件时直接禁用或拦截「已启用」复选框与「移除」按钮，强制引导用户前往「集控」设置页并通过管理员授权操作；
-/// 3. 应用本体抗停止保护：
-///    - 无依赖于是否加入集控（只要开启抗停止开关即生效）；
-///    - 接管托盘菜单（`NativeMenu`）中的「退出」与「重启」菜单项，点击「退出」时若开启了抗停止保护，要求管理员认证或直接拦截；点击「重启」时自动授予合法重启通行证；
-///    - 拦截主窗口非授权关闭与 `AppStopping` 非授权退出，并在进程被外部意外关闭时直接以原生可执行程序 `ClassIsland.Desktop.exe` 自拉起（零 PowerShell 调用，完全合规免杀）。
+/// 插件自我保护与 MINI 集控隐藏服务：
+/// 仅保护插件本体文件与启用状态（移除应用重启保护与应用退出保护）：
+/// 1. 对插件核心文件持有只读共享文件句柄锁并保存内存镜像，防止外部运行期删除或覆盖；
+/// 2. 拦截并清除未经授权的 `.disabled` 与 `.uninstall` 标记，并同步重置内存中的 `PluginInfo.RestartRequired` / `IsEnabled` / `IsUninstalling`；
+/// 3. 在设置窗口（`PluginsSettingsPage`）视觉树中，当选择本插件时直接禁用「已启用」复选框与「移除」按钮，引导用户前往「集控」设置页操作；
+/// 4. 进程正常退出时仅释放文件句柄锁并校验插件本体文件完整性，不干预或拦截宿主应用的退出与重启。
 /// </summary>
 public sealed class SelfProtectionService : IDisposable
 {
@@ -47,10 +42,7 @@ public sealed class SelfProtectionService : IDisposable
     private readonly Dictionary<string, byte[]> _pluginFileMirrors = new(StringComparer.OrdinalIgnoreCase);
     private FileSystemWatcher? _pluginFolderWatcher;
     private readonly Timer _guardTimer;
-    private bool _authorizedExitGranted;
     private bool _authorizedSelfUninstallRequested;
-    private bool _trayMenuHooked;
-    private bool _selfReviveTriggered;
 
     public bool IsSelfUninstallPending => _authorizedSelfUninstallRequested;
 
@@ -68,7 +60,6 @@ public sealed class SelfProtectionService : IDisposable
         if (_configStore.CurrentConfig.HasAcceptedSecurityWarning)
         {
             InitializePluginSelfProtection();
-            InitializeAppAntiStopProtection();
         }
 
         AppBase.Current.AppStarted += (_, _) =>
@@ -76,19 +67,17 @@ public sealed class SelfProtectionService : IDisposable
             if (_configStore.CurrentConfig.HasAcceptedSecurityWarning)
             {
                 ApplyMiniServerPluginListStealth();
-                TryHookMainWindowAndTrayMenu();
             }
         };
 
-        _guardTimer = new Timer(_ => PeriodicGuardTick(), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+        _guardTimer = new Timer(_ => PeriodicGuardTick(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
     }
 
     /// <summary>
-    /// 授权本次会话允许正常退出或重启（例如集控下发更新重启或合法卸载重启）。
+    /// 兼容保留的退出授权方法（已移除应用退出/重启拦截，无需额外操作）。
     /// </summary>
     public void GrantAuthorizedExit()
     {
-        _authorizedExitGranted = true;
     }
 
     /// <summary>
@@ -99,8 +88,8 @@ public sealed class SelfProtectionService : IDisposable
         try
         {
             _authorizedSelfUninstallRequested = true;
-            GrantAuthorizedExit();
             ReleaseFileLocks();
+            _configStore.ResetSecurityWarningAcceptanceForUninstall();
 
             if (!string.IsNullOrWhiteSpace(_pluginFolderPath) && Directory.Exists(_pluginFolderPath))
             {
@@ -174,8 +163,6 @@ public sealed class SelfProtectionService : IDisposable
         });
     }
 
-    #region 1. 插件自我保护 (Plugin Self-Protection)
-
     private void InitializePluginSelfProtection()
     {
         try
@@ -217,7 +204,12 @@ public sealed class SelfProtectionService : IDisposable
 
                     if (args.PropertyName is nameof(PluginInfo.IsEnabled) or nameof(PluginInfo.IsUninstalling) or nameof(PluginInfo.RestartRequired))
                     {
-                        Dispatcher.UIThread.Post(RemoveDisableAndUninstallMarkers);
+                        var disabledMarker = Path.Combine(_pluginFolderPath, ".disabled");
+                        var uninstallMarker = Path.Combine(_pluginFolderPath, ".uninstall");
+                        if (File.Exists(disabledMarker) || File.Exists(uninstallMarker) || selfInfo.RestartRequired)
+                        {
+                            Dispatcher.UIThread.Post(RemoveDisableAndUninstallMarkers);
+                        }
                     }
                 };
             }
@@ -232,6 +224,7 @@ public sealed class SelfProtectionService : IDisposable
             _pluginFolderWatcher.Changed += OnPluginDirectoryFileChanged;
             _pluginFolderWatcher.Renamed += OnPluginDirectoryFileChanged;
 
+            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
             Window.WindowOpenedEvent.AddClassHandler<Window>(OnWindowOpenedForPluginGuard);
             Control.LoadedEvent.AddClassHandler<Control>(OnControlLoadedForPluginGuard);
         }
@@ -357,7 +350,7 @@ public sealed class SelfProtectionService : IDisposable
             }
 
             var selfInfo = GetSelfPluginInfo();
-            if (selfInfo != null)
+            if (selfInfo != null && (hadDisabled || hadUninstall || selfInfo.RestartRequired))
             {
                 Dispatcher.UIThread.Post(() =>
                 {
@@ -367,9 +360,18 @@ public sealed class SelfProtectionService : IDisposable
                         {
                             selfInfo.RestartRequired = false;
                         }
-                        var notifyMethod = typeof(PluginInfo).GetMethod("OnPropertyChanged", BindingFlags.Instance | BindingFlags.NonPublic, null, [typeof(string)], null);
-                        notifyMethod?.Invoke(selfInfo, [nameof(PluginInfo.IsEnabled)]);
-                        notifyMethod?.Invoke(selfInfo, [nameof(PluginInfo.IsUninstalling)]);
+                        if (hadDisabled || hadUninstall)
+                        {
+                            var notifyMethod = typeof(PluginInfo).GetMethod("OnPropertyChanged", BindingFlags.Instance | BindingFlags.NonPublic, null, [typeof(string)], null);
+                            if (hadDisabled)
+                            {
+                                notifyMethod?.Invoke(selfInfo, [nameof(PluginInfo.IsEnabled)]);
+                            }
+                            if (hadUninstall)
+                            {
+                                notifyMethod?.Invoke(selfInfo, [nameof(PluginInfo.IsUninstalling)]);
+                            }
+                        }
                     }
                     catch
                     {
@@ -395,7 +397,8 @@ public sealed class SelfProtectionService : IDisposable
         {
             Path.Combine(_pluginFolderPath, "MiniClassIsland.ExtendManagement.dll"),
             Path.Combine(_pluginFolderPath, "manifest.yml"),
-            Path.Combine(_pluginFolderPath, "icon.png")
+            Path.Combine(_pluginFolderPath, "icon.png"),
+            Path.Combine(_pluginFolderPath, TamperEvidentConfigStore.SecurityAcceptedMarkerFileName)
         };
 
         foreach (var filePath in criticalFiles)
@@ -472,144 +475,6 @@ public sealed class SelfProtectionService : IDisposable
         }, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, true);
     }
 
-    #endregion
-
-    #region 2. 应用本体自我保护 (App Anti-Stop Protection)
-
-    private void InitializeAppAntiStopProtection()
-    {
-        try
-        {
-            AppBase.Current.AppStopping += OnAppStopping;
-            AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
-            Window.WindowOpenedEvent.AddClassHandler<Window>(OnWindowOpenedForClosingGuard);
-            TryHookMainWindowAndTrayMenu();
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "初始化应用本体抗停止保护时发生异常。");
-        }
-    }
-
-    private void OnWindowOpenedForClosingGuard(Window window, RoutedEventArgs e)
-    {
-        var typeName = window.GetType().Name;
-        if (typeName is "MainWindow" || window.Title == "PhonyRootWindow")
-        {
-            TryHookMainWindowAndTrayMenu();
-            window.Closing += (_, args) =>
-            {
-                if (_authorizedExitGranted)
-                {
-                    return;
-                }
-
-                if (args.CloseReason is not WindowCloseReason.OSShutdown)
-                {
-                    var mw = AppBase.Current.MainWindow;
-                    var vm = mw?.GetType().GetProperty("ViewModel", BindingFlags.Instance | BindingFlags.Public)?.GetValue(mw);
-                    vm?.GetType().GetProperty("IsClosing", BindingFlags.Instance | BindingFlags.Public)?.SetValue(vm, false);
-                    args.Cancel = true;
-                }
-            };
-        }
-    }
-
-    /// <summary>
-    /// 接管主窗口托盘菜单（NativeMenu）中的「退出」与「重启」按钮：
-    /// - 点击托盘「退出」时拦截并提示抗停止保护已启用；
-    /// - 点击托盘「重启」时自动授予合法重启许可，确保正常重启不被误拦截。
-    /// </summary>
-    private void TryHookMainWindowAndTrayMenu()
-    {
-        if (_trayMenuHooked)
-        {
-            return;
-        }
-
-        Dispatcher.UIThread.Post(() =>
-        {
-            try
-            {
-                var taskBarSvc = IAppHost.TryGetService<ITaskBarIconService>();
-                var menu = taskBarSvc?.MainTaskBarIcon?.Menu;
-                if (menu == null || menu.Items.Count == 0)
-                {
-                    return;
-                }
-
-                var hookedAny = false;
-                for (var i = 0; i < menu.Items.Count; i++)
-                {
-                    if (menu.Items[i] is not NativeMenuItem item)
-                    {
-                        continue;
-                    }
-
-                    var header = item.Header?.Trim() ?? string.Empty;
-                    if (header == "退出")
-                    {
-                        var guardedExitItem = new NativeMenuItem
-                        {
-                            Header = item.Header,
-                            Icon = item.Icon,
-                            ToolTip = item.ToolTip,
-                            IsEnabled = item.IsEnabled
-                        };
-                        guardedExitItem.Click += async (_, _) =>
-                        {
-                            await FluentAvaloniaBridge.ShowMessageDialogAsync(
-                                AppBase.Current.MainWindow,
-                                "退出受限",
-                                "当前已启用集控增强与抗停止保护，不允许直接退出 ClassIsland。");
-                        };
-                        menu.Items[i] = guardedExitItem;
-                        hookedAny = true;
-                    }
-                    else if (header == "重启")
-                    {
-                        var guardedRestartItem = new NativeMenuItem
-                        {
-                            Header = item.Header,
-                            Icon = item.Icon,
-                            ToolTip = item.ToolTip,
-                            IsEnabled = item.IsEnabled
-                        };
-                        guardedRestartItem.Click += (_, _) =>
-                        {
-                            GrantAuthorizedExit();
-                            AppBase.Current.Restart();
-                        };
-                        menu.Items[i] = guardedRestartItem;
-                        hookedAny = true;
-                    }
-                }
-
-                if (hookedAny)
-                {
-                    _trayMenuHooked = true;
-                    _logger.LogInformation("应用本体抗停止保护：已成功接管托盘退出与重启菜单保护。");
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "挂接托盘菜单抗停止保护时发生异常。");
-            }
-        });
-    }
-
-    private void OnAppStopping(object? sender, EventArgs e)
-    {
-        var isCrash = HostRuntimeBridge.IsAppCrashed();
-        if (_authorizedExitGranted || isCrash)
-        {
-            return;
-        }
-
-        _logger.LogWarning("检测到未经授权的应用停止操作，抗停止保护正在自动恢复应用运行。");
-        TrySpawnCleanSelfRevive();
-    }
-
     private void OnProcessExit(object? sender, EventArgs e)
     {
         ReleaseFileLocks();
@@ -617,44 +482,6 @@ public sealed class SelfProtectionService : IDisposable
         {
             RemoveDisableAndUninstallMarkers();
             HealPluginFilesIfMissing();
-        }
-
-        if (!_authorizedExitGranted && !HostRuntimeBridge.IsAppCrashed())
-        {
-            TrySpawnCleanSelfRevive();
-        }
-    }
-
-    /// <summary>
-    /// 直接通过原生可执行文件（ClassIsland.Desktop.exe -m -q）自拉起，不调用任何 PowerShell/cmd 脚本，避免触发杀毒软件启发式报毒。
-    /// </summary>
-    private void TrySpawnCleanSelfRevive()
-    {
-        if (_selfReviveTriggered)
-        {
-            return;
-        }
-        _selfReviveTriggered = true;
-
-        try
-        {
-            var exePath = AppBase.ExecutingEntrance;
-            if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
-            {
-                exePath = Environment.ProcessPath;
-            }
-            if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
-            {
-                Process.Start(new ProcessStartInfo(exePath)
-                {
-                    ArgumentList = { "-m", "-q" },
-                    UseShellExecute = false
-                });
-            }
-        }
-        catch
-        {
-            // Ignore
         }
     }
 
@@ -666,12 +493,6 @@ public sealed class SelfProtectionService : IDisposable
         }
 
         _configStore.VerifyAndHealDiskFile();
-        ApplyMiniServerPluginListStealth();
-
-        if (!_trayMenuHooked)
-        {
-            TryHookMainWindowAndTrayMenu();
-        }
 
         if (!_authorizedSelfUninstallRequested)
         {
@@ -679,8 +500,6 @@ public sealed class SelfProtectionService : IDisposable
             HealPluginFilesIfMissing();
         }
     }
-
-    #endregion
 
     public void Dispose()
     {

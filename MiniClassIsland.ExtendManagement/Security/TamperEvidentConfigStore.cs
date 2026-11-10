@@ -16,9 +16,12 @@ namespace MiniClassIsland.ExtendManagement.Security;
 /// </summary>
 public sealed class TamperEvidentConfigStore
 {
+    public const string SecurityAcceptedMarkerFileName = ".security_accepted";
+
     private readonly ILogger<TamperEvidentConfigStore> _logger;
     private readonly string _primaryFilePath;
     private readonly string _backupFilePath;
+    private readonly string _securityAcceptedMarkerPath;
     private readonly object _syncLock = new();
     private byte[]? _cachedSealedBytes;
 
@@ -31,12 +34,18 @@ public sealed class TamperEvidentConfigStore
 
     public event EventHandler? ConfigChanged;
 
-    public TamperEvidentConfigStore(ILogger<TamperEvidentConfigStore> logger, string pluginConfigFolder)
+    public TamperEvidentConfigStore(
+        ILogger<TamperEvidentConfigStore> logger,
+        string pluginConfigFolder,
+        string? pluginFolderPath = null)
     {
         _logger = logger;
         Directory.CreateDirectory(pluginConfigFolder);
         _primaryFilePath = Path.Combine(pluginConfigFolder, "permissions.sealed.json");
         _backupFilePath = Path.Combine(pluginConfigFolder, "permissions.sealed.bak");
+        _securityAcceptedMarkerPath = !string.IsNullOrWhiteSpace(pluginFolderPath)
+            ? Path.Combine(pluginFolderPath, SecurityAcceptedMarkerFileName)
+            : Path.Combine(pluginConfigFolder, SecurityAcceptedMarkerFileName);
         LoadOrInitialize();
     }
 
@@ -44,10 +53,16 @@ public sealed class TamperEvidentConfigStore
     {
         lock (_syncLock)
         {
+            var hasInstallMarker = File.Exists(_securityAcceptedMarkerPath);
             if (TryLoadFromFile(_primaryFilePath, out var cfg) ||
                 TryLoadFromFile(_backupFilePath, out cfg))
             {
                 CurrentConfig = cfg!;
+                if (CurrentConfig.HasAcceptedSecurityWarning && !hasInstallMarker)
+                {
+                    _logger.LogInformation("检测到插件为全新安装或重装实例（未发现安装目录安全确认标记），已重置首次安全警告确认状态。");
+                    CurrentConfig.HasAcceptedSecurityWarning = false;
+                }
                 SaveInternal(CurrentConfig);
                 return;
             }
@@ -58,8 +73,82 @@ public sealed class TamperEvidentConfigStore
                 IntegrityTamperDetected = true;
             }
 
-            CurrentConfig = new PermissionSwitchesConfig();
+            CurrentConfig = new PermissionSwitchesConfig
+            {
+                HasAcceptedSecurityWarning = false
+            };
             SaveInternal(CurrentConfig);
+        }
+    }
+
+    public void MarkSecurityWarningAccepted()
+    {
+        lock (_syncLock)
+        {
+            var dir = Path.GetDirectoryName(_securityAcceptedMarkerPath);
+            if (!string.IsNullOrWhiteSpace(dir) && Directory.Exists(dir))
+            {
+                File.WriteAllText(
+                    _securityAcceptedMarkerPath,
+                    $"ACCEPTED|{DateTimeOffset.UtcNow:O}",
+                    Encoding.UTF8);
+            }
+
+            var clone = CurrentConfig.Clone();
+            clone.HasAcceptedSecurityWarning = true;
+            CurrentConfig = clone;
+            IntegrityTamperDetected = false;
+            SaveInternal(CurrentConfig);
+        }
+        ConfigChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void ResetSecurityWarningAcceptanceForUninstall()
+    {
+        lock (_syncLock)
+        {
+            try
+            {
+                if (File.Exists(_securityAcceptedMarkerPath))
+                {
+                    File.SetAttributes(_securityAcceptedMarkerPath, FileAttributes.Normal);
+                    File.Delete(_securityAcceptedMarkerPath);
+                }
+            }
+            catch
+            {
+                // Ignore
+            }
+
+            var clone = CurrentConfig.Clone();
+            clone.HasAcceptedSecurityWarning = false;
+            clone.IsAppLocked = false;
+            CurrentConfig = clone;
+            SaveInternal(CurrentConfig);
+        }
+    }
+
+    /// <summary>
+    /// 由集控服务器指令或策略同步设置应用锁定状态，并持久化到防篡改存储。
+    /// </summary>
+    public void SetAppLockState(bool isLocked)
+    {
+        var changed = false;
+        lock (_syncLock)
+        {
+            if (CurrentConfig.IsAppLocked != isLocked)
+            {
+                var clone = CurrentConfig.Clone();
+                clone.IsAppLocked = isLocked;
+                CurrentConfig = clone;
+                IntegrityTamperDetected = false;
+                SaveInternal(CurrentConfig);
+                changed = true;
+            }
+        }
+        if (changed)
+        {
+            ConfigChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 

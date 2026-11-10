@@ -285,7 +285,7 @@ public sealed class HardwareCommandHandler(ILogger<HardwareCommandHandler> logge
         return await Dispatcher.UIThread.InvokeAsync(() =>
         {
             var result = new List<DisplayMonitorInfo>();
-            var screens = AppBase.Current.MainWindow?.Screens ?? AppBase.Current.GetRootWindow()?.Screens;
+            var screens = AppBase.Current.MainWindow?.Screens ?? FluentAvaloniaBridge.GetSafeOwnerWindow()?.Screens;
             if (screens == null)
             {
                 return result;

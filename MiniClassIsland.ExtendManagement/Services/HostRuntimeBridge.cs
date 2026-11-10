@@ -301,15 +301,23 @@ public static class HostRuntimeBridge
             // Ignore
         }
 
-        if (InspectManifestFileForMiniMarker())
+        if (InspectManifestFileForMiniMarker(out var manifestFlavor, out var manifestDisplayName, out var manifestClientId))
         {
-            MarkServerAsVerifiedMiniServer(server);
+            MarkServerAsVerifiedMiniServer(
+                server,
+                verified: true,
+                serverFlavor: manifestFlavor,
+                clientDisplayName: manifestDisplayName,
+                clientIdentity: manifestClientId);
             return true;
         }
 
-        if (InspectServerPublicKeyForMiniMarker())
+        if (InspectServerPublicKeyForMiniMarker(out var keyFlavor))
         {
-            MarkServerAsVerifiedMiniServer(server);
+            MarkServerAsVerifiedMiniServer(
+                server,
+                verified: true,
+                serverFlavor: keyFlavor);
             return true;
         }
 
@@ -359,14 +367,20 @@ public static class HostRuntimeBridge
                 return "MINI ClassIsland STE";
             }
 
-            if (File.Exists(ManagementManifestPath))
+            if (InspectManifestFileForMiniMarker(out var manifestFlavor, out _, out _) &&
+                manifestFlavor != null &&
+                manifestFlavor.Contains("ste", StringComparison.OrdinalIgnoreCase))
             {
-                var raw = File.ReadAllText(ManagementManifestPath, Encoding.UTF8);
-                if (raw.Contains("miniclassisland-ste", StringComparison.OrdinalIgnoreCase) ||
-                    raw.Contains("MINI ClassIsland STE", StringComparison.OrdinalIgnoreCase))
-                {
-                    return "MINI ClassIsland STE";
-                }
+                store?.UpdateNetworkMetadata(verifiedMiniServerFlavor: manifestFlavor);
+                return "MINI ClassIsland STE";
+            }
+
+            if (InspectServerPublicKeyForMiniMarker(out var keyFlavor) &&
+                keyFlavor != null &&
+                keyFlavor.Contains("ste", StringComparison.OrdinalIgnoreCase))
+            {
+                store?.UpdateNetworkMetadata(verifiedMiniServerFlavor: keyFlavor);
+                return "MINI ClassIsland STE";
             }
         }
         catch
@@ -452,6 +466,26 @@ public static class HostRuntimeBridge
 
         try
         {
+            if (response.Headers.TryGetValues("X-Server-Flavor", out var flavorHeaders))
+            {
+                foreach (var v in flavorHeaders)
+                {
+                    if (!string.IsNullOrWhiteSpace(v))
+                    {
+                        if (v.Contains("ste", StringComparison.OrdinalIgnoreCase))
+                        {
+                            isMini = true;
+                            detectedFlavor = "miniclassisland-ste";
+                        }
+                        else if (ContainsMiniClassIslandMarker(v))
+                        {
+                            isMini = true;
+                            detectedFlavor ??= "miniclassisland";
+                        }
+                    }
+                }
+            }
+
             if (response.Headers.TryGetValues("X-MiniClassIsland-Server", out var headerValues))
             {
                 foreach (var v in headerValues)
@@ -597,8 +631,14 @@ public static class HostRuntimeBridge
         return isMini;
     }
 
-    private static bool InspectManifestFileForMiniMarker()
+    private static bool InspectManifestFileForMiniMarker(
+        out string? detectedFlavor,
+        out string? clientDisplayName,
+        out string? clientIdentity)
     {
+        detectedFlavor = null;
+        clientDisplayName = null;
+        clientIdentity = null;
         try
         {
             if (!File.Exists(ManagementManifestPath))
@@ -607,7 +647,7 @@ public static class HostRuntimeBridge
             }
 
             var rawJson = File.ReadAllText(ManagementManifestPath, Encoding.UTF8);
-            return InspectJsonForMiniMarker(rawJson);
+            return InspectJsonForMiniMarker(rawJson, out detectedFlavor, out clientDisplayName, out clientIdentity);
         }
         catch
         {
@@ -615,8 +655,9 @@ public static class HostRuntimeBridge
         }
     }
 
-    private static bool InspectServerPublicKeyForMiniMarker()
+    private static bool InspectServerPublicKeyForMiniMarker(out string? detectedFlavor)
     {
+        detectedFlavor = null;
         try
         {
             if (!File.Exists(ServerPublicKeyPath))
@@ -630,10 +671,20 @@ public static class HostRuntimeBridge
                 return false;
             }
 
+            var isMini = false;
             // 1. 检查 Armored 头部注释
             if (ContainsMiniClassIslandMarker(keyText))
             {
-                return true;
+                isMini = true;
+                if (keyText.Contains("miniclassisland-ste", StringComparison.OrdinalIgnoreCase) ||
+                    keyText.Contains("MINI ClassIsland STE", StringComparison.OrdinalIgnoreCase))
+                {
+                    detectedFlavor = "miniclassisland-ste";
+                }
+                else
+                {
+                    detectedFlavor = "miniclassisland";
+                }
             }
 
             // 2. 解析 OpenPGP 二进制数据包中的 UserID（Base64 解码后的真实签名者信息）
@@ -646,10 +697,23 @@ public static class HostRuntimeBridge
                     if (ContainsMiniClassIslandMarker(uidStr) ||
                         (uidStr != null && uidStr.Contains("CyreneMSP Server", StringComparison.OrdinalIgnoreCase)))
                     {
-                        return true;
+                        isMini = true;
+                        if (uidStr != null &&
+                            (uidStr.Contains("miniclassisland-ste", StringComparison.OrdinalIgnoreCase) ||
+                             uidStr.Contains("MINI ClassIsland STE", StringComparison.OrdinalIgnoreCase) ||
+                             uidStr.Contains("ste@miniclassisland", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            detectedFlavor = "miniclassisland-ste";
+                        }
+                        else
+                        {
+                            detectedFlavor ??= "miniclassisland";
+                        }
                     }
                 }
             }
+
+            return isMini;
         }
         catch
         {

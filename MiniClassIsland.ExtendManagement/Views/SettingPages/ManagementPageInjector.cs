@@ -1,3 +1,4 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Documents;
 using Avalonia.Interactivity;
@@ -71,14 +72,34 @@ public sealed class ManagementPageInjector
 
         if (control.GetType().FullName == "ClassIsland.Views.SettingPages.ManagementSettingsPage")
         {
-            try
+            TryInjectWithRetry(control);
+        }
+    }
+
+    private void TryInjectWithRetry(Control managementPage)
+    {
+        try
+        {
+            InjectOptionsPanelIntoManagementPage(managementPage);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "向集控设置页面注入集控增强选项时发生异常。");
+        }
+
+        foreach (var priority in new[] { DispatcherPriority.Loaded, DispatcherPriority.Render })
+        {
+            Dispatcher.UIThread.Post(() =>
             {
-                InjectOptionsPanelIntoManagementPage(control);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "向集控设置页面注入集控增强选项时发生异常。");
-            }
+                try
+                {
+                    InjectOptionsPanelIntoManagementPage(managementPage);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "延迟向集控设置页面注入集控增强选项重试异常。");
+                }
+            }, priority);
         }
     }
 
@@ -187,20 +208,18 @@ public sealed class ManagementPageInjector
             if (tb.Inlines is { Count: >= 2 } &&
                 tb.Inlines[0] is Run labelRun &&
                 string.Equals(labelRun.Text?.Trim(), "ID：", StringComparison.Ordinal) &&
-                tb.Inlines[1] is Run idValueRun)
+                tb.Inlines[1] is Run)
             {
                 var effectiveId = HostRuntimeBridge.GetEffectiveClientIdentity(_managementService);
                 var rawLocalId = _managementService.Settings.ClassIdentity?.Trim();
+                var replacementRun = new Run(string.IsNullOrWhiteSpace(rawLocalId)
+                    ? (string.IsNullOrWhiteSpace(effectiveId) ? "未设置" : effectiveId)
+                    : rawLocalId);
                 if (string.IsNullOrWhiteSpace(rawLocalId))
                 {
-                    idValueRun.Text = string.IsNullOrWhiteSpace(effectiveId) ? "未设置" : effectiveId;
-                    idValueRun.Foreground = new SolidColorBrush(Color.FromArgb(150, 128, 128, 128));
+                    replacementRun.Foreground = new SolidColorBrush(Color.FromArgb(150, 128, 128, 128));
                 }
-                else
-                {
-                    idValueRun.Text = rawLocalId;
-                    idValueRun.ClearValue(TextElement.ForegroundProperty);
-                }
+                tb.Inlines[1] = replacementRun;
             }
         }
     }
@@ -218,9 +237,9 @@ public sealed class ManagementPageInjector
             if (tb.Inlines is { Count: >= 2 } &&
                 tb.Inlines[0] is Run labelRun &&
                 string.Equals(labelRun.Text?.Trim(), "服务端类型：", StringComparison.Ordinal) &&
-                tb.Inlines[1] is Run kindValueRun)
+                tb.Inlines[1] is Run)
             {
-                kindValueRun.Text = displayServerKind;
+                tb.Inlines[1] = new Run(displayServerKind);
             }
         }
     }

@@ -6,6 +6,7 @@ using ClassIsland.Core.Abstractions.Services.Management;
 using Microsoft.Extensions.Logging;
 using MiniClassIsland.ExtendManagement.Models;
 using MiniClassIsland.ExtendManagement.Services;
+using Org.BouncyCastle.Bcpg.OpenPgp;
 using PgpCore;
 
 namespace MiniClassIsland.ExtendManagement.Security;
@@ -168,25 +169,74 @@ public sealed class CommandSignatureVerifier
     {
         try
         {
-            var encryptionKeys = new EncryptionKeys(publicKeyArmored);
-            using var pgp = new PGP(encryptionKeys);
+            var cleanPubKey = publicKeyArmored.TrimStart('\uFEFF').Trim();
+            var cleanSig = signatureArmored.TrimStart('\uFEFF').Trim();
 
-            if (signatureArmored.Contains("BEGIN PGP SIGNATURE", StringComparison.Ordinal))
+            if (cleanSig.Contains("BEGIN PGP SIGNED MESSAGE", StringComparison.Ordinal))
             {
-                await using var dataStream = new MemoryStream(Encoding.UTF8.GetBytes(canonicalText));
-                await using var sigStream = new MemoryStream(Encoding.UTF8.GetBytes(signatureArmored));
-                return await pgp.VerifyAsync(dataStream, sigStream);
-            }
-
-            if (signatureArmored.Contains("BEGIN PGP SIGNED MESSAGE", StringComparison.Ordinal))
-            {
-                await using var clearStream = new MemoryStream(Encoding.UTF8.GetBytes(signatureArmored));
+                var encryptionKeys = new EncryptionKeys(cleanPubKey);
+                using var pgp = new PGP(encryptionKeys);
+                await using var clearStream = new MemoryStream(Encoding.UTF8.GetBytes(cleanSig));
                 var verified = await pgp.VerifyClearStreamAsync(clearStream);
                 if (!verified)
                 {
                     return false;
                 }
-                return signatureArmored.Contains(canonicalText, StringComparison.Ordinal);
+                return cleanSig.Contains(canonicalText, StringComparison.Ordinal);
+            }
+
+            if (cleanSig.Contains("BEGIN PGP SIGNATURE", StringComparison.Ordinal))
+            {
+                await using var keyStream = new MemoryStream(Encoding.UTF8.GetBytes(cleanPubKey));
+                using var keyDecoder = PgpUtilities.GetDecoderStream(keyStream);
+                var pgpPubRingBundle = new PgpPublicKeyRingBundle(keyDecoder);
+
+                await using var sigStream = new MemoryStream(Encoding.UTF8.GetBytes(cleanSig));
+                using var sigDecoder = PgpUtilities.GetDecoderStream(sigStream);
+                var pgpFact = new PgpObjectFactory(sigDecoder);
+                var nextObj = pgpFact.NextPgpObject();
+                if (nextObj is PgpCompressedData compressedData)
+                {
+                    pgpFact = new PgpObjectFactory(compressedData.GetDataStream());
+                    nextObj = pgpFact.NextPgpObject();
+                }
+
+                if (nextObj is not PgpSignatureList sigList || sigList.Count == 0)
+                {
+                    return false;
+                }
+
+                var dataBytes = Encoding.UTF8.GetBytes(canonicalText);
+                for (var i = 0; i < sigList.Count; i++)
+                {
+                    var sig = sigList[i];
+                    var pubKey = pgpPubRingBundle.GetPublicKey(sig.KeyId);
+                    if (pubKey is null)
+                    {
+                        foreach (PgpPublicKeyRing ring in pgpPubRingBundle.GetKeyRings())
+                        {
+                            pubKey = ring.GetPublicKey();
+                            if (pubKey is not null)
+                            {
+                                break;
+                            }
+                        }
+                    }
+
+                    if (pubKey is null)
+                    {
+                        continue;
+                    }
+
+                    sig.InitVerify(pubKey);
+                    sig.Update(dataBytes, 0, dataBytes.Length);
+                    if (sig.Verify())
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
 
             return false;

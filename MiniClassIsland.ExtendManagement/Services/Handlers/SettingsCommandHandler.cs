@@ -4,17 +4,19 @@ using Avalonia.Threading;
 using ClassIsland.Core.Abstractions.Services.Management;
 using Microsoft.Extensions.Logging;
 using MiniClassIsland.ExtendManagement.Networking;
+using MiniClassIsland.ExtendManagement.Security;
 
 namespace MiniClassIsland.ExtendManagement.Services.Handlers;
 
 /// <summary>
-/// 应用设置管理处理器（settings.get, settings.patch, settings.sync_default, settings.set_overlay, settings.remove_overlay）。
-/// 修复上游仅在 OOBE 前拉取一次 DefaultSettingsSource 的缺陷，并支持运行时增量变更与 Overlay 锁定。
+/// 应用设置管理处理器（settings.get, settings.patch, settings.sync_default, settings.set_overlay, settings.remove_overlay, settings.app_lock）。
+/// 修复上游仅在 OOBE 前拉取一次 DefaultSettingsSource 的缺陷，并支持运行时增量变更、Overlay 锁定与服务端受控应用锁定。
 /// </summary>
 public sealed class SettingsCommandHandler(
     ILogger<SettingsCommandHandler> logger,
     IManagementService managementService,
-    NetworkRoamingCoordinator roamingCoordinator)
+    NetworkRoamingCoordinator roamingCoordinator,
+    AppLockService appLockService)
 {
     public async Task<JsonElement> ExecuteAsync(string action, JsonElement payload)
     {
@@ -26,8 +28,82 @@ public sealed class SettingsCommandHandler(
             "settings.sync_default" => await SyncDefaultSettingsFromServerAsync(force: true),
             "settings.set_overlay" => await SetSettingsOverlayAsync(payload),
             "settings.remove_overlay" => await RemoveSettingsOverlayAsync(payload),
+            "settings.app_lock" or "settings.set_app_lock" => ExecuteAppLockCommand(normalized, payload),
             _ => throw new NotSupportedException($"不支持的设置指令：{action}")
         };
+    }
+
+    public JsonElement ExecuteAppLockCommand(string action, JsonElement payload)
+    {
+        var normalized = action.Trim().ToLowerInvariant();
+        if (normalized is "lock.status" or "app.lock_status")
+        {
+            return JsonSerializer.SerializeToElement(new
+            {
+                isAppLocked = appLockService.IsEffectiveAppLocked
+            });
+        }
+
+        bool targetLockState;
+        if (normalized is "lock.enable" or "app.lock")
+        {
+            targetLockState = true;
+            if (payload.ValueKind == JsonValueKind.Object &&
+                TryReadBooleanProperty(payload, out var explicitBool, "locked", "isAppLocked", "enabled", "value"))
+            {
+                targetLockState = explicitBool;
+            }
+        }
+        else if (normalized is "lock.disable" or "app.unlock")
+        {
+            targetLockState = false;
+        }
+        else
+        {
+            if (payload.ValueKind == JsonValueKind.True || payload.ValueKind == JsonValueKind.False)
+            {
+                targetLockState = payload.GetBoolean();
+            }
+            else if (payload.ValueKind == JsonValueKind.Object &&
+                     TryReadBooleanProperty(payload, out var parsed, "locked", "isAppLocked", "enabled", "value"))
+            {
+                targetLockState = parsed;
+            }
+            else
+            {
+                targetLockState = true;
+            }
+        }
+
+        appLockService.SetAppLockedFromServer(targetLockState, $"服务端远程指令 ({normalized})");
+        return JsonSerializer.SerializeToElement(new
+        {
+            updated = true,
+            isAppLocked = appLockService.IsEffectiveAppLocked,
+            requestedState = targetLockState
+        });
+    }
+
+    private static bool TryReadBooleanProperty(JsonElement obj, out bool result, params string[] candidateNames)
+    {
+        foreach (var prop in obj.EnumerateObject())
+        {
+            if (candidateNames.Any(c => string.Equals(prop.Name, c, StringComparison.OrdinalIgnoreCase)))
+            {
+                if (prop.Value.ValueKind == JsonValueKind.True)
+                {
+                    result = true;
+                    return true;
+                }
+                if (prop.Value.ValueKind == JsonValueKind.False)
+                {
+                    result = false;
+                    return true;
+                }
+            }
+        }
+        result = false;
+        return false;
     }
 
     public async Task<JsonElement> SyncDefaultSettingsFromServerAsync(bool force = false)
@@ -52,6 +128,11 @@ public sealed class SettingsCommandHandler(
         if (remoteJson.ValueKind != JsonValueKind.Object)
         {
             throw new InvalidOperationException("远程默认设置格式无效。");
+        }
+
+        if (TryReadBooleanProperty(remoteJson, out var remoteAppLock, "IsAppLocked", "AppLockEnabled", "appLock"))
+        {
+            appLockService.SetAppLockedFromServer(remoteAppLock, "集控默认设置同步 (DefaultSettingsSource)");
         }
 
         var updatedProps = await ApplyJsonPatchToSettingsObjectAsync(remoteJson);
@@ -87,6 +168,11 @@ public sealed class SettingsCommandHandler(
         if (patchNode.ValueKind != JsonValueKind.Object)
         {
             throw new ArgumentException("settings.patch 需要提供 JSON 对象格式的设置键值。");
+        }
+
+        if (TryReadBooleanProperty(patchNode, out var patchedAppLock, "IsAppLocked", "AppLockEnabled", "appLock"))
+        {
+            appLockService.SetAppLockedFromServer(patchedAppLock, "settings.patch 增量更新");
         }
 
         var updated = await ApplyJsonPatchToSettingsObjectAsync(patchNode);

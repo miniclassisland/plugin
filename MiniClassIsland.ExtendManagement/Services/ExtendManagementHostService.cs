@@ -6,6 +6,7 @@ using System.Text.Json;
 using Avalonia.Threading;
 using ClassIsland.Core;
 using ClassIsland.Core.Abstractions.Services.Management;
+using ClassIsland.Shared.Abstraction.Services;
 using ClassIsland.Shared.Models.Management;
 using ClassIsland.Shared.Protobuf.Client;
 using ClassIsland.Shared.Protobuf.Enum;
@@ -31,9 +32,11 @@ public sealed class ExtendManagementHostService(
     CommandSignatureVerifier signatureVerifier,
     PolicyIntegrityMonitor policyMonitor,
     SelfProtectionService selfProtectionService,
+    AppLockService appLockService,
     NetworkRoamingCoordinator roamingCoordinator,
     PairingDialogEnhancer pairingDialogEnhancer,
     ManagementPageInjector managementPageInjector,
+    PluginApiHookService pluginApiHookService,
     HardwareCommandHandler hardwareHandler,
     SettingsCommandHandler settingsHandler,
     ProfileCommandHandler profileHandler,
@@ -55,21 +58,29 @@ public sealed class ExtendManagementHostService(
             AppBase.Current.AppStarted += (_, _) => PromptFirstRunSecurityWarning();
             Avalonia.Controls.Window.WindowOpenedEvent.AddClassHandler<Avalonia.Controls.Window>((w, _) =>
             {
-                if (w.GetType().Name is "MainWindow" or "SettingsWindowNew")
+                if (w != null && !string.Equals(w.Title, "安全风险警告 — MINI ClassIsland 集控增强组件", StringComparison.Ordinal))
                 {
                     PromptFirstRunSecurityWarning();
                 }
             });
+            Dispatcher.UIThread.Post(PromptFirstRunSecurityWarning, DispatcherPriority.ApplicationIdle);
             return Task.CompletedTask;
         }
 
         _ = roamingCoordinator;
         _ = pairingDialogEnhancer;
         _ = selfProtectionService;
+        _ = appLockService;
         _ = managementPageInjector;
+        _ = pluginApiHookService;
 
         AttachManagementHooks();
-        AppBase.Current.AppStarted += (_, _) => AttachManagementHooks();
+        AppBase.Current.AppStarted += (_, _) =>
+        {
+            AttachManagementHooks();
+            _ = Task.Run(SyncClientHookAndHardwareSnapshotToServerAsync);
+        };
+        _ = Task.Run(SyncClientHookAndHardwareSnapshotToServerAsync);
 
         return Task.CompletedTask;
     }
@@ -89,7 +100,7 @@ public sealed class ExtendManagementHostService(
             if (accepted)
             {
                 logger.LogInformation("用户已同意安全风险警告，正在保存确认状态并重启应用以加载插件功能。");
-                configStore.UpdateFromLocalUi(c => c.HasAcceptedSecurityWarning = true);
+                configStore.MarkSecurityWarningAccepted();
                 selfProtectionService.GrantAuthorizedExit();
                 AppBase.Current.Restart();
             }
@@ -126,7 +137,7 @@ public sealed class ExtendManagementHostService(
         var detailBlock = new Avalonia.Controls.TextBlock
         {
             Text = "1. 同级运行与深层控制：本组件运行在 ClassIsland 应用本体同级上下文中，允许受信任的集控服务器采集本机详细硬件信息、修改应用设置、在运行时热更新与切换多套档案。\n" +
-                   "2. 自我保护与抗停止：组件包含插件自我保护与应用本体抗停止能力，启用后将阻止未经授权的插件禁用、卸载或强制结束进程。\n" +
+                   "2. 插件自我保护：启用后组件将开启插件本体保护，防止插件文件被外部篡改、非授权禁用或移除（需在【集控】设置页面移除集控增强）。\n" +
                    "3. 高敏扩展与远程运维：本组件启用后，受信任的集控服务器将能够编辑自动化、控制更新、管理插件与主题，以及执行经加密签名校验的外部指令、捕获屏幕截图、发送模拟点击及读取进程清单。\n\n" +
                    "是否确认信任所接入的集控环境并同意启用本组件？\n" +
                    "• 点击【同意并重启加载】：保存确认状态并立即重启应用以正式加载组件。\n" +
@@ -221,9 +232,50 @@ public sealed class ExtendManagementHostService(
             return;
         }
 
+        PreemptGetClientConfigForSignedEnvelopes(managementService.Connection);
         managementService.Connection.CommandReceived -= OnManagementCommandReceived;
         managementService.Connection.CommandReceived += OnManagementCommandReceived;
         policyMonitor.CaptureGoldenSnapshot();
+    }
+
+    private static void PreemptGetClientConfigForSignedEnvelopes(IManagementServerConnection conn)
+    {
+        try
+        {
+            var connType = conn.GetType();
+            var eventField = connType.GetField("CommandReceived", BindingFlags.Instance | BindingFlags.NonPublic);
+            var origMethod = connType.GetMethod("OnCommandReceived", BindingFlags.Instance | BindingFlags.NonPublic);
+            if (eventField == null || origMethod == null)
+            {
+                return;
+            }
+
+            if (eventField.GetValue(conn) is not EventHandler<ClientCommandEventArgs> currentDelegate)
+            {
+                return;
+            }
+
+            foreach (var d in currentDelegate.GetInvocationList())
+            {
+                if (d.Method == origMethod && ReferenceEquals(d.Target, conn))
+                {
+                    conn.CommandReceived -= (EventHandler<ClientCommandEventArgs>)d;
+                    conn.CommandReceived += (_, args) =>
+                    {
+                        if (args.Type == CommandTypes.GetClientConfig && TryExtractSignedEnvelope(args, out SignedCommandEnvelope? _))
+                        {
+                            return;
+                        }
+                        origMethod.Invoke(conn, [conn, args]);
+                    };
+                    break;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore reflection differences
+        }
     }
 
     private async void OnManagementCommandReceived(object? sender, ClientCommandEventArgs e)
@@ -283,7 +335,39 @@ public sealed class ExtendManagementHostService(
             {
                 logger.LogDebug(ex, "运行时热重载集控档案异常。");
             }
+
+            await SyncClientHookAndHardwareSnapshotToServerAsync();
         });
+    }
+
+    private async Task SyncClientHookAndHardwareSnapshotToServerAsync()
+    {
+        try
+        {
+            await Task.Delay(1500);
+            if (!managementService.IsManagementEnabled)
+            {
+                return;
+            }
+
+            var settingsCatalog = await pluginApiHookService.GetPluginSettingsCatalogAsync();
+            var registeredComponents = await pluginApiHookService.GetRegisteredComponentsAsync(includeBuiltIn: true);
+            using var emptyDoc = JsonDocument.Parse("{}");
+            var hardwareInfo = await hardwareHandler.ExecuteAsync("hardware.get_info", emptyDoc.RootElement);
+
+            await roamingCoordinator.ReportHookSnapshotAsync(new
+            {
+                extend_management_version = "2.0.0.3",
+                is_app_locked = appLockService.IsEffectiveAppLocked,
+                plugin_settings = settingsCatalog,
+                plugin_components = registeredComponents,
+                hardware_info = hardwareInfo
+            });
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "同步客户端 Hook 清单与硬件信息快照跳过或异常。");
+        }
     }
 
     private static bool TryExtractSignedEnvelope(ClientCommandEventArgs e, out SignedCommandEnvelope? envelope)
@@ -396,6 +480,53 @@ public sealed class ExtendManagementHostService(
         {
             return await remoteControlHandler.ExecuteAsync(action, payload);
         }
+        if (action.StartsWith("lock.", StringComparison.Ordinal) ||
+            action.StartsWith("app.lock", StringComparison.Ordinal) ||
+            action.StartsWith("app.unlock", StringComparison.Ordinal))
+        {
+            return settingsHandler.ExecuteAppLockCommand(action, payload);
+        }
+        if (action is "extend.status" or "extend.ping" or "system.status" or "extend.info")
+        {
+            return JsonSerializer.SerializeToElement(new
+            {
+                extendManagementEnabled = true,
+                pluginId = SelfProtectionService.PluginId,
+                version = "2.0.0.3",
+                serverFlavor = HostRuntimeBridge.GetMiniServerDisplayKind(managementService),
+                isAppLocked = appLockService.IsEffectiveAppLocked,
+                features = new[]
+                {
+                    "hardware", "settings", "profile", "components",
+                    "automation", "update", "plugin", "plugin.api_hook",
+                    "theme", "remote", "management.exit", "lock"
+                },
+                timestampUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            });
+        }
+        if (action is "management.exit" or "client.exit_management" or "client.unregister")
+        {
+            var reason = "集控服务器远程移除了此设备";
+            if (payload.ValueKind == JsonValueKind.Object &&
+                payload.TryGetProperty("reason", out var rProp) &&
+                rProp.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(rProp.GetString()))
+            {
+                reason = rProp.GetString()!;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(350);
+                roamingCoordinator.ExecuteLocalExitManagementAndRestart(reason);
+            });
+
+            return JsonSerializer.SerializeToElement(new
+            {
+                exiting = true,
+                reason
+            });
+        }
 
         throw new NotSupportedException($"不支持的指令动作：{action}");
     }
@@ -461,7 +592,9 @@ public sealed class ExtendManagementHostService(
                 return;
             }
 
-            var metadata = getMetadataMethod?.Invoke(conn, [false]) as Grpc.Core.Metadata;
+            var metadata = getMetadataMethod?.Invoke(conn, [false]) as Grpc.Core.Metadata ?? [];
+            metadata.Add("x-extend-management-enabled", "1");
+            metadata.Add("x-extend-management-version", "2.0.0.3");
             var payloadJson = JsonSerializer.Serialize(response);
 
             var uploadClient = new ConfigUpload.ConfigUploadClient(channel);

@@ -41,6 +41,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 {
     private const string ProtocolName = "Cyrene_MSP";
     private const string ProtocolVersion = "2.0.0.0";
+    private static readonly UTF8Encoding Utf8NoBom = new(false);
 
     [GeneratedRegex(@"Pairing\s*Code\s*[:：]\s*([A-Z0-9]{4,16})", RegexOptions.IgnoreCase)]
     private static partial Regex PairingCodeRegex();
@@ -110,17 +111,20 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             _logger.LogWarning(ex, "向加入集控弹窗注入 MINI ClassIsland 增强组件时发生异常。");
         }
 
-        Dispatcher.UIThread.Post(() =>
+        foreach (var priority in new[] { DispatcherPriority.Loaded, DispatcherPriority.Render, DispatcherPriority.Background })
         {
-            try
+            Dispatcher.UIThread.Post(() =>
             {
-                AttachToJoinManagementDialog(dialog);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "延迟向加入集控弹窗注入 MINI ClassIsland 增强组件时发生异常。");
-            }
-        }, DispatcherPriority.Loaded);
+                try
+                {
+                    AttachToJoinManagementDialog(dialog);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "延迟向加入集控弹窗注入 MINI ClassIsland 增强组件重试异常。");
+                }
+            }, priority);
+        }
     }
 
     private static StackPanel? ResolveJoinDialogStackPanel(Control dialog)
@@ -171,21 +175,44 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             return false;
         }
 
-        // 记录原生卡片的子控件，方便在“快速加入”模式与“原版配置文件”模式之间原地切换
+        // 查找原生元素，做到 100% 保持原项目视觉风格与结构：
+        // 原生 JoinManagementDialog 的 rootStack 包含：
+        // [0] TextBlock ("加入管理", SubtitleTextBlockStyle)
+        // [1] TextBlock ("将当前ClassIsland实例连接到管理组织。")
+        // [2] Grid ("配置文件：" + FileBrowserButton)
+        // [3] Field (Label="ID（可选）", Content=TextBox 绑定 ViewModel.ManagementSettings.ClassIdentity)
+        // [4] TextBlock (ErrorMessage, Foreground=IndianRed)
+        // [5] ProgressBar (IsWorking)
+        // [6] Bottom Grid -> Inner Grid -> [Button("取消"), Button("连接", Classes={"accent"})]
         var nativeChildren = rootStack.Children.ToList();
 
-        // 查找原生标题（若存在则保留在顶部）
-        TextBlock? nativeTitleBlock = null;
-        if (nativeChildren.FirstOrDefault() is TextBlock firstTb && nativeChildren.Count >= 4)
-        {
-            nativeTitleBlock = firstTb;
-            nativeChildren.Remove(firstTb);
-        }
+        TextBlock? nativeTitleBlock = nativeChildren.OfType<TextBlock>()
+            .FirstOrDefault(tb => string.Equals(tb.Text?.Trim(), "加入管理", StringComparison.Ordinal))
+            ?? nativeChildren.FirstOrDefault() as TextBlock;
 
-        // 查找原生红色错误文本控件
+        TextBlock? nativeSubtitleBlock = nativeChildren.OfType<TextBlock>()
+            .FirstOrDefault(tb => tb != nativeTitleBlock && (tb.Text?.Contains("连接", StringComparison.Ordinal) == true || tb.Text?.Contains("管理", StringComparison.Ordinal) == true));
+
+        Grid? nativeConfigFileRow = nativeChildren.OfType<Grid>()
+            .FirstOrDefault(g => g.ColumnDefinitions.Count == 2 &&
+                                 Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(g)
+                                     .OfType<TextBlock>()
+                                     .Any(tb => tb.Text?.Contains("配置文件", StringComparison.Ordinal) == true || tb.Inlines?.Count > 0));
+
+        Control? nativeIdField = nativeChildren
+            .FirstOrDefault(c => c.GetType().FullName == "ClassIsland.Core.Controls.Field");
+        TextBox? nativeIdTextBox = (nativeIdField?.GetType().GetProperty("Content")?.GetValue(nativeIdField) as TextBox)
+            ?? (nativeIdField != null ? Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(nativeIdField).OfType<TextBox>().FirstOrDefault() : null);
+
         var errorTextBlock = rootStack.Children
             .OfType<TextBlock>()
             .FirstOrDefault(tb => tb.Foreground is ISolidColorBrush brush && brush.Color == Colors.IndianRed);
+
+        var nativeProgressBar = rootStack.Children.OfType<ProgressBar>().FirstOrDefault();
+
+        Button? nativeConnectButton = Avalonia.VisualTree.VisualExtensions.GetVisualDescendants(rootStack)
+            .OfType<Button>()
+            .FirstOrDefault(b => b.Classes.Contains("accent") || string.Equals(b.Content as string, "连接", StringComparison.Ordinal));
 
         CancellationTokenSource? pollingCts = null;
         void StopPolling()
@@ -202,12 +229,12 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             pollingCts = null;
         }
 
-        // 构建直接内嵌在注册集控窗口内的配对码展示面板
+        // 构建与原版 FluentAvalonia 视觉主题一致的内嵌配对码展示面板
         var pairingCodeText = new TextBlock
         {
             FontFamily = new FontFamily("Consolas, Monospace"),
-            FontSize = 24,
-            FontWeight = FontWeight.Bold,
+            FontSize = 22,
+            FontWeight = FontWeight.SemiBold,
             LetterSpacing = 2,
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center
@@ -218,6 +245,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             FontSize = 12,
             Opacity = 0.78,
             VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
             Text = "请将上方配对码提供给集控管理员进行审批"
         };
 
@@ -245,11 +273,9 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 
         var codeDisplayBox = new Border
         {
-            CornerRadius = new CornerRadius(6),
-            Padding = new Thickness(12, 10),
-            Margin = new Thickness(0, 6, 0, 6),
-            Background = new SolidColorBrush(Color.FromArgb(24, 0, 191, 255)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(90, 0, 191, 255)),
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(12, 8),
+            Margin = new Thickness(0, 4, 0, 4),
             BorderThickness = new Thickness(1),
             Child = new Grid
             {
@@ -261,6 +287,22 @@ public sealed partial class PairingDialogEnhancer : IDisposable
                 }
             }
         };
+        if (Application.Current != null && Application.Current.TryFindResource("SubtleFillColorSecondaryBrush", out var subtleBg) && subtleBg is IBrush bgBrush)
+        {
+            codeDisplayBox.Background = bgBrush;
+        }
+        else
+        {
+            codeDisplayBox.Background = new SolidColorBrush(Color.FromArgb(20, 128, 128, 128));
+        }
+        if (Application.Current != null && Application.Current.TryFindResource("ControlStrokeColorDefaultBrush", out var strokeRes) && strokeRes is IBrush strokeBrush)
+        {
+            codeDisplayBox.BorderBrush = strokeBrush;
+        }
+        else
+        {
+            codeDisplayBox.BorderBrush = new SolidColorBrush(Color.FromArgb(50, 128, 128, 128));
+        }
         Grid.SetColumn(pairingCodeText, 0);
         Grid.SetColumn(copyButton, 1);
 
@@ -269,18 +311,16 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             IsIndeterminate = true,
             Height = 3,
             HorizontalAlignment = HorizontalAlignment.Stretch,
-            Margin = new Thickness(0, 4, 0, 0)
+            Margin = new Thickness(0, 2, 0, 0)
         };
 
         var inlinePairingPanel = new Border
         {
             Name = "MciInlinePairingPanel",
             IsVisible = false,
-            Margin = new Thickness(0, 10, 0, 4),
-            Padding = new Thickness(12),
-            CornerRadius = new CornerRadius(8),
-            Background = new SolidColorBrush(Color.FromArgb(18, 128, 128, 128)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(55, 128, 128, 128)),
+            Margin = new Thickness(0, 8, 0, 4),
+            Padding = new Thickness(12, 10),
+            CornerRadius = new CornerRadius(6),
             BorderThickness = new Thickness(1),
             Child = new StackPanel
             {
@@ -293,10 +333,11 @@ public sealed partial class PairingDialogEnhancer : IDisposable
                         Spacing = 6,
                         Children =
                         {
-                            FluentAvaloniaBridge.CreateGlyphIcon("\uE9D5", 15, new SolidColorBrush(Color.FromRgb(0, 191, 255))),
+                            FluentAvaloniaBridge.CreateGlyphIcon("\uE9D5", 14),
                             new TextBlock
                             {
-                                Text = "设备配对码",
+                                Text = "等待集控管理员审批配对",
+                                FontSize = 13,
                                 FontWeight = FontWeight.SemiBold,
                                 VerticalAlignment = VerticalAlignment.Center
                             }
@@ -308,6 +349,22 @@ public sealed partial class PairingDialogEnhancer : IDisposable
                 }
             }
         };
+        if (Application.Current != null && Application.Current.TryFindResource("CardBackgroundFillColorDefaultBrush", out var cardBg) && cardBg is IBrush cardBgBrush)
+        {
+            inlinePairingPanel.Background = cardBgBrush;
+        }
+        else
+        {
+            inlinePairingPanel.Background = new SolidColorBrush(Color.FromArgb(16, 128, 128, 128));
+        }
+        if (Application.Current != null && Application.Current.TryFindResource("CardStrokeColorDefaultBrush", out var cardStroke) && cardStroke is IBrush cardStrokeBrush)
+        {
+            inlinePairingPanel.BorderBrush = cardStrokeBrush;
+        }
+        else
+        {
+            inlinePairingPanel.BorderBrush = new SolidColorBrush(Color.FromArgb(45, 128, 128, 128));
+        }
 
         void ShowInlinePairingPanel(ManagementSettings activeSettings, string rawCode)
         {
@@ -336,85 +393,47 @@ public sealed partial class PairingDialogEnhancer : IDisposable
                 ref pollingCts);
         }
 
-        // 构建原地切换的“快速加入”内嵌卡片面板
+        // 构建与原版 JoinManagementDialog 100% 视觉同构的“租户或地址”原生 Field 控件
         var currentSettings = GetVmProperty<ManagementSettings>(vm, "ManagementSettings") ?? new ManagementSettings();
         var slugBox = new TextBox
         {
-            Watermark = "例如 school 或 https://school.miniclassisland.com",
+            Watermark = "租户标识或集控服务器地址",
             Text = _configStore.CurrentConfig.LastTenantSlug
         };
 
-        var classIdBox = new TextBox
+        var quickTenantField = FluentAvaloniaBridge.CreateNativeField(
+            label: "租户或地址",
+            content: slugBox,
+            margin: new Thickness(0, 12, 0, 0));
+        quickTenantField.Name = "MciInPlaceQuickJoinField";
+        quickTenantField.IsVisible = false;
+
+        // 兜底：若万一未找到原生 ID Field 或底部连接按钮，则提供备用控件
+        var fallbackClassIdBox = new TextBox
         {
-            Watermark = "选填，例如 高一(1)班 或 class-101",
             Text = currentSettings.ClassIdentity ?? string.Empty
         };
-
-        var quickErrorText = new TextBlock
+        var fallbackErrorText = errorTextBlock ?? new TextBlock
         {
             Foreground = Brushes.IndianRed,
-            FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 8, 0, 0),
             IsVisible = false
         };
-
-        var quickProgress = new ProgressBar
+        var fallbackProgress = nativeProgressBar ?? new ProgressBar
         {
             IsIndeterminate = true,
             IsVisible = false,
-            HorizontalAlignment = HorizontalAlignment.Stretch
+            Margin = new Thickness(0, 8, 0, 0)
         };
-
-        var quickJoinButton = new Button
+        var fallbackButton = nativeConnectButton ?? new Button
         {
-            Content = "立即加入",
+            Content = "连接",
             Classes = { "accent" },
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            HorizontalContentAlignment = HorizontalAlignment.Center,
-            Padding = new Thickness(12, 7),
+            HorizontalAlignment = HorizontalAlignment.Right,
             IsDefault = true
         };
 
-        var inPlaceQuickJoinCard = new StackPanel
-        {
-            Name = "MciInPlaceQuickJoinCard",
-            IsVisible = false,
-            Spacing = 10,
-            Margin = new Thickness(0, 6, 0, 4),
-            Children =
-            {
-                new TextBlock
-                {
-                    Text = "输入组织或学校的租户标识直接加入 MINI ClassIsland 集控服务。",
-                    FontSize = 12,
-                    Opacity = 0.82,
-                    TextWrapping = TextWrapping.Wrap
-                },
-                new StackPanel
-                {
-                    Spacing = 4,
-                    Children =
-                    {
-                        new TextBlock { Text = "租户标识", FontSize = 12, FontWeight = FontWeight.SemiBold },
-                        slugBox
-                    }
-                },
-                new StackPanel
-                {
-                    Spacing = 4,
-                    Children =
-                    {
-                        new TextBlock { Text = "ID（可选）", FontSize = 12, FontWeight = FontWeight.SemiBold },
-                        classIdBox
-                    }
-                },
-                quickErrorText,
-                quickProgress,
-                quickJoinButton
-            }
-        };
-
-        // 顶部状态与“快速加入”原地切换按钮
         var isQuickJoinMode = false;
         var modeButtonText = new TextBlock
         {
@@ -425,20 +444,64 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 
         var miniButton = BuildMiniBrandToggleButton(modeButtonText);
 
+        void UpdateConnectButtonState()
+        {
+            if (isQuickJoinMode)
+            {
+                var hasSlug = !string.IsNullOrWhiteSpace(slugBox.Text);
+                SetVmProperty(vm, "IsConfigLoaded", hasSlug);
+                if (nativeConnectButton != null)
+                {
+                    nativeConnectButton.IsEnabled = hasSlug;
+                }
+            }
+            else
+            {
+                var configPath = GetVmProperty<string>(vm, "ConfigFilePath");
+                var loaded = !string.IsNullOrWhiteSpace(configPath) && File.Exists(configPath);
+                SetVmProperty(vm, "IsConfigLoaded", loaded);
+                if (nativeConnectButton != null)
+                {
+                    nativeConnectButton.IsEnabled = loaded;
+                }
+            }
+        }
+
+        slugBox.TextChanged += (_, _) =>
+        {
+            if (isQuickJoinMode)
+            {
+                UpdateConnectButtonState();
+            }
+        };
+
         void SetQuickJoinMode(bool enableQuickJoin)
         {
             isQuickJoinMode = enableQuickJoin;
-            modeButtonText.Text = enableQuickJoin ? "返回文件导入" : "快速加入";
-            quickErrorText.IsVisible = false;
+            modeButtonText.Text = enableQuickJoin ? "配置文件" : "快速加入";
+            ToolTip.SetTip(miniButton, enableQuickJoin ? "切换回使用配置文件导入加入集控" : "使用租户标识或服务器地址快速加入集控");
 
-            foreach (var child in nativeChildren)
+            SetVmProperty(vm, "IsErrorMessageOpen", false);
+            if (errorTextBlock != null)
             {
-                child.IsVisible = !enableQuickJoin;
+                errorTextBlock.IsVisible = false;
             }
 
-            inPlaceQuickJoinCard.IsVisible = enableQuickJoin;
+            if (nativeSubtitleBlock != null)
+            {
+                nativeSubtitleBlock.Text = enableQuickJoin
+                    ? "输入租户标识或服务器地址，将当前ClassIsland实例连接到管理组织。"
+                    : "将当前ClassIsland实例连接到管理组织。";
+            }
 
-            // 若弹窗底部存在原生 ContentDialog 按钮栏，则在快速加入模式下将焦点交给卡片内的“立即加入”按钮
+            if (nativeConfigFileRow != null)
+            {
+                nativeConfigFileRow.IsVisible = !enableQuickJoin;
+            }
+
+            quickTenantField.IsVisible = enableQuickJoin;
+            UpdateConnectButtonState();
+
             if (enableQuickJoin)
             {
                 Dispatcher.UIThread.Post(() => slugBox.Focus(), DispatcherPriority.Input);
@@ -450,20 +513,33 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             SetQuickJoinMode(!isQuickJoinMode);
         };
 
-        quickJoinButton.Click += async (_, _) =>
+        // 拦截原生右下角“连接”按钮（Tunnel 路由），当处于快速加入模式时直接执行快速加入工作流
+        if (nativeConnectButton != null)
         {
-            await ExecuteDirectQuickJoinWorkflowAsync(
-                dialog,
-                vm,
-                slugBox,
-                classIdBox,
-                quickErrorText,
-                quickProgress,
-                quickJoinButton,
-                ShowInlinePairingPanel);
-        };
+            nativeConnectButton.AddHandler(
+                Button.ClickEvent,
+                async (_, e) =>
+                {
+                    if (!isQuickJoinMode)
+                    {
+                        return;
+                    }
+                    e.Handled = true;
+                    var idBox = nativeIdTextBox ?? fallbackClassIdBox;
+                    await ExecuteDirectQuickJoinWorkflowAsync(
+                        dialog,
+                        vm,
+                        slugBox,
+                        idBox,
+                        fallbackErrorText,
+                        fallbackProgress,
+                        nativeConnectButton,
+                        ShowInlinePairingPanel);
+                },
+                RoutingStrategies.Tunnel);
+        }
 
-        // 组装顶部栏
+        // 组装顶部标题栏：保持原生 "加入管理" SubtitleTextBlockStyle 标题，右侧放置轻量化切换按钮
         if (nativeTitleBlock != null)
         {
             var headerIndex = rootStack.Children.IndexOf(nativeTitleBlock);
@@ -483,43 +559,36 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             headerGrid.Children.Add(miniButton);
 
             rootStack.Children.Insert(headerIndex, headerGrid);
-            rootStack.Children.Insert(headerIndex + 1, inPlaceQuickJoinCard);
         }
         else
         {
-            var topBar = new Border
-            {
-                Name = "MciEnhancedMarker",
-                Margin = new Thickness(0, 0, 0, 8),
-                Padding = new Thickness(10, 6),
-                CornerRadius = new CornerRadius(6),
-                Background = new SolidColorBrush(Color.FromArgb(20, 0, 191, 255)),
-                BorderBrush = new SolidColorBrush(Color.FromArgb(65, 0, 191, 255)),
-                BorderThickness = new Thickness(1),
-                Child = new Grid
-                {
-                    ColumnDefinitions = new ColumnDefinitions("*,Auto"),
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Children =
-                    {
-                        new TextBlock
-                        {
-                            Text = "MINI ClassIsland 集控支持",
-                            FontSize = 12,
-                            FontWeight = FontWeight.SemiBold,
-                            VerticalAlignment = VerticalAlignment.Center
-                        },
-                        miniButton
-                    }
-                }
-            };
-            Grid.SetColumn(miniButton, 1);
-            rootStack.Children.Insert(0, topBar);
-            rootStack.Children.Insert(1, inPlaceQuickJoinCard);
+            miniButton.Name = "MciEnhancedMarker";
+            miniButton.HorizontalAlignment = HorizontalAlignment.Right;
+            rootStack.Children.Insert(0, miniButton);
         }
 
-        // 插入配对码展示卡片（始终位于底部，无论原生模式还是快速加入模式都可显示）
-        rootStack.Children.Add(inlinePairingPanel);
+        // 将“租户或地址”原生 Field 精确插入到“配置文件：”行所在的位置
+        if (nativeConfigFileRow != null)
+        {
+            var configRowIdx = rootStack.Children.IndexOf(nativeConfigFileRow);
+            rootStack.Children.Insert(configRowIdx + 1, quickTenantField);
+        }
+        else
+        {
+            var insertIdx = Math.Min(2, rootStack.Children.Count);
+            rootStack.Children.Insert(insertIdx, quickTenantField);
+        }
+
+        // 将内嵌配对码面板放置在进度条之后、底部“取消/连接”按钮栏之前
+        if (nativeProgressBar != null)
+        {
+            var progIdx = rootStack.Children.IndexOf(nativeProgressBar);
+            rootStack.Children.Insert(progIdx + 1, inlinePairingPanel);
+        }
+        else
+        {
+            rootStack.Children.Add(inlinePairingPanel);
+        }
 
         // 监听原生模式下的配对码报错并自动转为内嵌配对码卡片
         if (vm is System.ComponentModel.INotifyPropertyChanged vmNotify)
@@ -618,28 +687,34 @@ public sealed partial class PairingDialogEnhancer : IDisposable
         Button joinButton,
         Action<ManagementSettings, string> onPairingCodeReceived)
     {
+        void ShowError(string msg)
+        {
+            SetVmProperty(vm, "ErrorMessage", msg);
+            SetVmProperty(vm, "IsErrorMessageOpen", true);
+            errorText.Text = msg;
+            errorText.IsVisible = true;
+        }
+
+        SetVmProperty(vm, "IsErrorMessageOpen", false);
         errorText.IsVisible = false;
 
         if (_managementService.IsManagementEnabled)
         {
-            errorText.Text = "当前客户端已加入集控管理，无法重复加入。";
-            errorText.IsVisible = true;
+            ShowError("当前客户端已加入集控管理，无法重复加入。");
             return;
         }
 
         var rawSlug = (slugBox.Text ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(rawSlug))
         {
-            errorText.Text = "请输入租户标识或集控服务器地址。";
-            errorText.IsVisible = true;
+            ShowError("请输入租户标识或集控服务器地址。");
             return;
         }
 
         var serverUrl = ResolveTenantServerUrl(rawSlug, _configStore.CurrentConfig.DefaultBaseDomain);
         if (string.IsNullOrWhiteSpace(serverUrl))
         {
-            errorText.Text = "租户标识或服务器地址格式无效，请检查后重试。";
-            errorText.IsVisible = true;
+            ShowError("租户标识或服务器地址格式无效，请检查后重试。");
             return;
         }
 
@@ -659,6 +734,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 
         SetVmProperty(vm, "ManagementSettings", settings);
         SetVmProperty(vm, "IsErrorMessageOpen", false);
+        SetVmProperty(vm, "IsWorking", true);
 
         progressBar.IsVisible = true;
         joinButton.IsEnabled = false;
@@ -679,7 +755,9 @@ public sealed partial class PairingDialogEnhancer : IDisposable
                 { "cuid", clientUid.ToString() },
                 { "protocol_name", ProtocolName },
                 { "protocol_version", ProtocolVersion },
-                { "session", string.Empty }
+                { "session", string.Empty },
+                { "x-extend-management-enabled", "1" },
+                { "x-extend-management-version", "2.0.0.1" }
             };
             if (!string.IsNullOrWhiteSpace(tenantSlug))
             {
@@ -704,8 +782,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 
             if (regRsp.Retcode != Retcode.Registered && regRsp.Retcode != Retcode.Success)
             {
-                errorText.Text = $"无法注册实例：{regRsp.Message}";
-                errorText.IsVisible = true;
+                ShowError($"无法注册实例：{regRsp.Message}");
                 return;
             }
 
@@ -713,7 +790,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             Directory.CreateDirectory(HostRuntimeBridge.ManagementConfigureFolderPath);
             if (!string.IsNullOrWhiteSpace(regRsp.ServerPublicKey))
             {
-                await File.WriteAllTextAsync(HostRuntimeBridge.ServerPublicKeyPath, regRsp.ServerPublicKey, Encoding.UTF8);
+                await File.WriteAllTextAsync(HostRuntimeBridge.ServerPublicKeyPath, regRsp.ServerPublicKey.TrimStart('\uFEFF'), Utf8NoBom);
             }
 
             var manifestUrl = $"{serverUrl}/api/v1/client/{clientUid}/manifest";
@@ -722,8 +799,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 
             if (manifest.CoreVersion.Major != IAppHost.CoreVersion.Major)
             {
-                errorText.Text = $"集控服务核心版本（{manifest.CoreVersion}）与当前客户端核心版本（{IAppHost.CoreVersion}）不兼容。";
-                errorText.IsVisible = true;
+                ShowError($"集控服务核心版本（{manifest.CoreVersion}）与当前客户端核心版本（{IAppHost.CoreVersion}）不兼容。");
                 return;
             }
 
@@ -763,13 +839,13 @@ public sealed partial class PairingDialogEnhancer : IDisposable
             }
 
             _logger.LogWarning(ex, "MINI ClassIsland 快速加入集控失败。");
-            errorText.Text = $"连接集控服务器失败：{ex.Message}";
-            errorText.IsVisible = true;
+            ShowError($"连接集控服务器失败：{ex.Message}");
         }
         finally
         {
+            SetVmProperty(vm, "IsWorking", false);
             progressBar.IsVisible = false;
-            joinButton.IsEnabled = true;
+            joinButton.IsEnabled = !string.IsNullOrWhiteSpace(slugBox.Text);
             slugBox.IsEnabled = true;
             classIdBox.IsEnabled = true;
         }
@@ -979,7 +1055,7 @@ public sealed partial class PairingDialogEnhancer : IDisposable
 
             if (!string.IsNullOrWhiteSpace(serverPublicKey))
             {
-                await File.WriteAllTextAsync(HostRuntimeBridge.ServerPublicKeyPath, serverPublicKey, Encoding.UTF8);
+                await File.WriteAllTextAsync(HostRuntimeBridge.ServerPublicKeyPath, serverPublicKey.TrimStart('\uFEFF'), Utf8NoBom);
             }
 
             var manifestUrl = $"{settings.ManagementServer.TrimEnd('/')}/api/v1/client/{_managementService.Persist.ClientUniqueId}/manifest";

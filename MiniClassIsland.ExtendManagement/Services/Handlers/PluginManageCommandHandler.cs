@@ -14,7 +14,8 @@ namespace MiniClassIsland.ExtendManagement.Services.Handlers;
 public sealed class PluginManageCommandHandler(
     ILogger<PluginManageCommandHandler> logger,
     IPluginMarketService pluginMarketService,
-    NetworkRoamingCoordinator roamingCoordinator)
+    NetworkRoamingCoordinator roamingCoordinator,
+    PluginApiHookService pluginApiHookService)
 {
     public async Task<JsonElement> ExecuteAsync(string action, JsonElement payload)
     {
@@ -26,8 +27,31 @@ public sealed class PluginManageCommandHandler(
             "plugin.set_enabled" => await SetPluginEnabledAsync(payload),
             "plugin.uninstall" => await SetPluginUninstallStateAsync(payload),
             "plugin.refresh_market" => await RefreshMarketAsync(),
+            "plugin.api_snapshot" or "plugin.hook.snapshot" => await pluginApiHookService.GetFullApiSnapshotAsync(TryGetPluginId(payload)),
+            "plugin.get_settings" or "plugin.settings.list" or "plugin.settings.get" => await pluginApiHookService.GetPluginSettingsCatalogAsync(TryGetPluginId(payload)),
+            "plugin.set_settings" or "plugin.settings.set" or "plugin.settings.put" => await pluginApiHookService.SetPluginSettingsAsync(payload),
+            "plugin.list_components" or "plugin.components.list" or "plugin.components.registry" => await pluginApiHookService.GetRegisteredComponentsAsync(
+                includeBuiltIn: !payload.TryGetProperty("pluginOnly", out var poProp) || poProp.ValueKind != JsonValueKind.True,
+                filterPluginId: TryGetPluginId(payload)),
+            "plugin.get_component_settings" or "plugin.components.get_settings" or "plugin.components.instances" => await pluginApiHookService.GetActiveComponentInstancesSettingsAsync(
+                filterPluginId: TryGetPluginId(payload),
+                filterComponentId: payload.TryGetProperty("componentId", out var cidProp) ? cidProp.GetString()?.Trim() : null),
+            "plugin.set_component_settings" or "plugin.components.set_settings" => await pluginApiHookService.UpdateActiveComponentInstanceSettingsAsync(payload),
             _ => throw new NotSupportedException($"不支持的插件管理指令：{action}")
         };
+    }
+
+    private static string? TryGetPluginId(JsonElement payload)
+    {
+        if (payload.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+        if (payload.TryGetProperty("pluginId", out var idProp) && idProp.ValueKind == JsonValueKind.String)
+        {
+            return idProp.GetString()?.Trim();
+        }
+        return null;
     }
 
     private static async Task<JsonElement> ListPluginsAsync()

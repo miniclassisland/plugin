@@ -27,7 +27,8 @@ public class Plugin : PluginBase
         // 1. 注册防篡改权限开关存储、端到端签名验证器、策略完整性监控与自我保护服务
         services.AddSingleton(sp => new TamperEvidentConfigStore(
             sp.GetRequiredService<ILogger<TamperEvidentConfigStore>>(),
-            configFolder));
+            configFolder,
+            pluginFolder));
 
         services.AddSingleton(sp => new CommandSignatureVerifier(
             sp.GetRequiredService<ILogger<CommandSignatureVerifier>>(),
@@ -42,10 +43,13 @@ public class Plugin : PluginBase
             sp.GetRequiredService<TamperEvidentConfigStore>(),
             pluginFolder));
 
-        // 2. 注册网卡切换/IP 跳变漫游优化协调器、加入集控窗口增强器与集控设置页注入器
+        services.AddSingleton<AppLockService>();
+
+        // 2. 注册网卡切换/IP 跳变漫游优化协调器、加入集控窗口增强器、集控设置页注入器与插件标准 API Hook 服务
         services.AddSingleton<NetworkRoamingCoordinator>();
         services.AddSingleton<PairingDialogEnhancer>();
         services.AddSingleton<ManagementPageInjector>();
+        services.AddSingleton<PluginApiHookService>();
 
         // 3. 注册三级集控业务指令处理器
         services.AddSingleton<HardwareCommandHandler>();

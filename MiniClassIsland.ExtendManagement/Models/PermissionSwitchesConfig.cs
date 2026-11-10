@@ -40,6 +40,11 @@ public partial class PermissionSwitchesConfig : ObservableObject
     [ObservableProperty]
     private string _serverClientIdentity = string.Empty;
 
+    // ---- 服务端受控应用锁定标记 ----
+
+    [ObservableProperty]
+    private bool _isAppLocked = false;
+
     public PermissionSwitchesConfig Clone()
     {
         return new PermissionSwitchesConfig
@@ -52,7 +57,8 @@ public partial class PermissionSwitchesConfig : ObservableObject
             IsVerifiedMiniServer = IsVerifiedMiniServer,
             VerifiedMiniServerFlavor = VerifiedMiniServerFlavor,
             ServerClientDisplayName = ServerClientDisplayName,
-            ServerClientIdentity = ServerClientIdentity
+            ServerClientIdentity = ServerClientIdentity,
+            IsAppLocked = IsAppLocked
         };
     }
 }

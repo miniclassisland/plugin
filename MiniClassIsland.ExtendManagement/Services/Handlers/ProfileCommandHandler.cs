@@ -16,7 +16,8 @@ public sealed class ProfileCommandHandler(
     ILogger<ProfileCommandHandler> logger,
     IProfileService profileService,
     ILessonsService lessonsService,
-    IComponentsService componentsService)
+    IComponentsService componentsService,
+    PluginApiHookService pluginApiHookService)
 {
     public string ProfilesDirectoryPath => Path.Combine(CommonDirectories.AppRootFolderPath, "Profiles");
     public string ComponentLayoutsDirectoryPath => Path.Combine(CommonDirectories.AppConfigPath, "ComponentLayouts");
@@ -47,6 +48,13 @@ public sealed class ProfileCommandHandler(
             "profile.components.put" or "profile.components.save" or "components.put" or "components.save" => await SaveComponentConfigAsync(payload),
             "profile.components.switch" or "components.switch" => await SwitchComponentConfigAsync(payload),
             "profile.components.reload" or "components.reload" => await ReloadComponentsAtRuntimeAsync(),
+            "components.registry" or "components.registered" => await pluginApiHookService.GetRegisteredComponentsAsync(
+                includeBuiltIn: !payload.TryGetProperty("pluginOnly", out var poProp) || poProp.ValueKind != JsonValueKind.True,
+                filterPluginId: payload.TryGetProperty("pluginId", out var pidProp) ? pidProp.GetString()?.Trim() : null),
+            "components.get_instance_settings" or "components.instances" => await pluginApiHookService.GetActiveComponentInstancesSettingsAsync(
+                filterPluginId: payload.TryGetProperty("pluginId", out var pid2Prop) ? pid2Prop.GetString()?.Trim() : null,
+                filterComponentId: payload.TryGetProperty("componentId", out var cidProp) ? cidProp.GetString()?.Trim() : null),
+            "components.set_instance_settings" => await pluginApiHookService.UpdateActiveComponentInstanceSettingsAsync(payload),
             _ => throw new NotSupportedException($"不支持的档案指令：{action}")
         };
     }

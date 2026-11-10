@@ -1,10 +1,18 @@
+using System.ComponentModel;
 using System.Net.Http.Headers;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using Avalonia.Threading;
+using ClassIsland.Core;
 using ClassIsland.Core.Abstractions.Services.Management;
+using ClassIsland.Shared.Helpers;
+using ClassIsland.Shared.Models.Management;
+using ClassIsland.Shared.Protobuf.Client;
+using ClassIsland.Shared.Protobuf.Service;
+using Grpc.Net.Client;
 using Microsoft.Extensions.Logging;
 using MiniClassIsland.ExtendManagement.Security;
 using MiniClassIsland.ExtendManagement.Services;
@@ -32,6 +40,11 @@ public sealed class NetworkRoamingCoordinator : IDisposable
     private readonly HttpClient _httpClient;
     private CancellationTokenSource? _roamingReconnectCts;
     private string _lastNetworkFingerprint = string.Empty;
+    private string _cachedServerUrl = string.Empty;
+    private string _cachedGrpcUrl = string.Empty;
+    private string _cachedClientUid = string.Empty;
+    private bool _wasManagementEnabled;
+    private bool _remoteExitInProgress;
     private bool _disposed;
 
     public NetworkRoamingCoordinator(
@@ -52,6 +65,14 @@ public sealed class NetworkRoamingCoordinator : IDisposable
             EnsureAnchoredPhysicalMac();
             _lastNetworkFingerprint = ComputeActiveNetworkFingerprint();
 
+            CacheCurrentManagementEndpoints();
+            _wasManagementEnabled = _managementService.IsManagementEnabled && _managementService.Settings.IsManagementEnabled;
+
+            if (_managementService.Settings is INotifyPropertyChanged npc)
+            {
+                npc.PropertyChanged += OnManagementSettingsPropertyChanged;
+            }
+
             NetworkChange.NetworkAddressChanged += OnNetworkAddressChanged;
             NetworkChange.NetworkAvailabilityChanged += OnNetworkAvailabilityChanged;
 
@@ -59,6 +80,61 @@ public sealed class NetworkRoamingCoordinator : IDisposable
             {
                 _ = Task.Run(() => ProbeCurrentManagementServerFlavorAsync());
             }
+        }
+    }
+
+    private void CacheCurrentManagementEndpoints()
+    {
+        try
+        {
+            var server = (_managementService.Settings.ManagementServer ?? string.Empty).Trim().TrimEnd('/');
+            var grpc = (_managementService.Settings.ManagementServerGrpc ?? string.Empty).Trim().TrimEnd('/');
+            var cuid = _managementService.Persist.ClientUniqueId.ToString();
+            if (!string.IsNullOrWhiteSpace(server))
+            {
+                _cachedServerUrl = server;
+            }
+            if (!string.IsNullOrWhiteSpace(grpc))
+            {
+                _cachedGrpcUrl = grpc;
+            }
+            if (!string.IsNullOrWhiteSpace(cuid))
+            {
+                _cachedClientUid = cuid;
+            }
+        }
+        catch
+        {
+            // Ignore
+        }
+    }
+
+    private void OnManagementSettingsPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_remoteExitInProgress)
+        {
+            return;
+        }
+
+        if (string.Equals(e.PropertyName, nameof(ManagementSettings.IsManagementEnabled), StringComparison.OrdinalIgnoreCase))
+        {
+            var currentEnabled = _managementService.Settings.IsManagementEnabled;
+            if (_wasManagementEnabled && !currentEnabled)
+            {
+                _wasManagementEnabled = false;
+                _configStore.SetAppLockState(false);
+                _logger.LogInformation("检测到客户端主动退出集控，正在通知集控服务器同步解绑设备...");
+                _ = Task.Run(() => NotifyServerUnregisterAsync(_cachedServerUrl, _cachedGrpcUrl, _cachedClientUid));
+            }
+            else if (currentEnabled)
+            {
+                _wasManagementEnabled = true;
+                CacheCurrentManagementEndpoints();
+            }
+        }
+        else
+        {
+            CacheCurrentManagementEndpoints();
         }
     }
 
@@ -86,17 +162,65 @@ public sealed class NetworkRoamingCoordinator : IDisposable
             using var resp = await _httpClient.SendAsync(req, cancellationToken);
             var rawBody = await resp.Content.ReadAsStringAsync(cancellationToken);
 
+            if (resp.Headers.TryGetValues("X-Client-Registration-Status", out var regStatusValues))
+            {
+                var status = regStatusValues.FirstOrDefault()?.Trim();
+                if (string.Equals(status, "unregistered", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogWarning("探测到当前设备已在集控服务器端被移除（unregistered），正在自动同步退出集控并重启应用...");
+                    ExecuteLocalExitManagementAndRestart("集控服务器已远程移除此设备");
+                    return false;
+                }
+            }
+
             if (HostRuntimeBridge.InspectHttpResponseForMiniMarker(resp, rawBody))
             {
                 HostRuntimeBridge.MarkServerAsVerifiedMiniServer(server, true);
+                TryApplyAppLockFromManifestOrPolicyJson(rawBody);
                 return true;
             }
+            TryApplyAppLockFromManifestOrPolicyJson(rawBody);
         }
         catch
         {
             // Ignore probe failure
         }
         return HostRuntimeBridge.IsJoinedMiniClassIslandServer(_managementService);
+    }
+
+    private void TryApplyAppLockFromManifestOrPolicyJson(string rawJson)
+    {
+        if (string.IsNullOrWhiteSpace(rawJson))
+        {
+            return;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(rawJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, "IsAppLocked", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(prop.Name, "AppLockEnabled", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(prop.Name, "app_locked", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.True || prop.Value.ValueKind == JsonValueKind.False)
+                    {
+                        _configStore.SetAppLockState(prop.Value.GetBoolean());
+                        return;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore non-JSON or unrelated payload
+        }
     }
 
     public string EnsureAnchoredPhysicalMac()
@@ -235,8 +359,237 @@ public sealed class NetworkRoamingCoordinator : IDisposable
         }
 
         var cuid = _managementService.Persist.ClientUniqueId.ToString();
+        var mac = EnsureAnchoredPhysicalMac();
         request.Headers.TryAddWithoutValidation("x-client-uid", cuid);
+        if (!string.IsNullOrWhiteSpace(mac))
+        {
+            request.Headers.TryAddWithoutValidation("x-client-mac", mac);
+        }
+        request.Headers.TryAddWithoutValidation("x-extend-management-enabled", "1");
+        request.Headers.TryAddWithoutValidation("x-extend-management-version", "2.0.0.3");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+    }
+
+    public async Task ReportHookSnapshotAsync(object snapshotPayload, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (!_managementService.IsManagementEnabled)
+            {
+                return;
+            }
+
+            var server = (_managementService.Settings.ManagementServer ?? string.Empty).Trim().TrimEnd('/');
+            var grpc = (_managementService.Settings.ManagementServerGrpc ?? string.Empty).Trim().TrimEnd('/');
+            var cuid = _managementService.Persist.ClientUniqueId.ToString().Trim();
+            var baseUrl = ExtractBaseHttpOrigin(server, grpc);
+            if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(cuid))
+            {
+                return;
+            }
+
+            var snapshotUrl = $"{baseUrl}/api/v1/client/{Uri.EscapeDataString(cuid)}/hook-snapshot";
+            var jsonBody = JsonSerializer.Serialize(snapshotPayload);
+            using var req = new HttpRequestMessage(HttpMethod.Post, snapshotUrl)
+            {
+                Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
+            };
+            AttachSessionHeaders(req);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(10));
+            using var resp = await _httpClient.SendAsync(req, cts.Token);
+            _logger.LogDebug("已向集控服务器同步 Hook 快照 ({StatusCode})。", (int)resp.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "向集控服务器同步 Hook 快照未完成。");
+        }
+    }
+
+    public async Task NotifyServerUnregisterAsync(
+        string? serverUrlOverride = null,
+        string? grpcUrlOverride = null,
+        string? clientUidOverride = null)
+    {
+        try
+        {
+            var server = (serverUrlOverride ?? _cachedServerUrl ?? _managementService.Settings.ManagementServer ?? string.Empty).Trim().TrimEnd('/');
+            var grpc = (grpcUrlOverride ?? _cachedGrpcUrl ?? _managementService.Settings.ManagementServerGrpc ?? string.Empty).Trim().TrimEnd('/');
+            var cuid = (clientUidOverride ?? _cachedClientUid ?? _managementService.Persist.ClientUniqueId.ToString()).Trim();
+            var mac = EnsureAnchoredPhysicalMac();
+            var sessionId = TryGetCurrentSessionId();
+
+            if (string.IsNullOrWhiteSpace(cuid))
+            {
+                return;
+            }
+
+            // 1. 尝试通过 HTTP POST /api/v1/client/{cuid}/unregister 通知服务器解绑
+            var baseUrl = ExtractBaseHttpOrigin(server, grpc);
+            if (!string.IsNullOrWhiteSpace(baseUrl))
+            {
+                try
+                {
+                    var unregisterUrl = $"{baseUrl}/api/v1/client/{Uri.EscapeDataString(cuid)}/unregister";
+                    using var req = new HttpRequestMessage(HttpMethod.Post, unregisterUrl)
+                    {
+                        Content = new StringContent("{}", Encoding.UTF8, "application/json")
+                    };
+                    if (!string.IsNullOrWhiteSpace(sessionId))
+                    {
+                        req.Headers.TryAddWithoutValidation("x-client-session", sessionId);
+                        req.Headers.TryAddWithoutValidation("session", sessionId);
+                    }
+                    req.Headers.TryAddWithoutValidation("x-client-uid", cuid);
+                    if (!string.IsNullOrWhiteSpace(mac))
+                    {
+                        req.Headers.TryAddWithoutValidation("x-client-mac", mac);
+                    }
+                    req.Headers.TryAddWithoutValidation("x-extend-management-enabled", "1");
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+                    using var resp = await _httpClient.SendAsync(req, cts.Token);
+                    _logger.LogInformation("已向集控服务器发送 HTTP 解绑请求 ({StatusCode})。", (int)resp.StatusCode);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "HTTP 解绑通知发送未完成。");
+                }
+            }
+
+            // 2. 尝试通过 gRPC ClientRegister.UnRegisterAsync 通知服务器解绑
+            var grpcTarget = !string.IsNullOrWhiteSpace(grpc) ? grpc : baseUrl;
+            if (!string.IsNullOrWhiteSpace(grpcTarget))
+            {
+                try
+                {
+                    using var channel = GrpcChannel.ForAddress(grpcTarget, new GrpcChannelOptions
+                    {
+                        HttpHandler = new SocketsHttpHandler
+                        {
+                            EnableMultipleHttp2Connections = true,
+                            ConnectTimeout = TimeSpan.FromSeconds(3)
+                        }
+                    });
+                    var client = new ClientRegister.ClientRegisterClient(channel);
+                    var metadata = new Grpc.Core.Metadata
+                    {
+                        { "cuid", cuid },
+                        { "x-extend-management-enabled", "1" }
+                    };
+                    if (!string.IsNullOrWhiteSpace(sessionId))
+                    {
+                        metadata.Add("session", sessionId);
+                    }
+                    await client.UnRegisterAsync(
+                        new ClientRegisterCsReq
+                        {
+                            ClientUid = cuid,
+                            ClientMac = mac ?? string.Empty
+                        },
+                        headers: metadata,
+                        deadline: DateTime.UtcNow.AddSeconds(3));
+                    _logger.LogInformation("已向集控服务器发送 gRPC UnRegister 解绑请求。");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "gRPC UnRegister 解绑通知发送未完成。");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "通知服务器解绑异常。");
+        }
+    }
+
+    private static string ExtractBaseHttpOrigin(string serverUrl, string grpcUrl)
+    {
+        foreach (var candidate in new[] { grpcUrl, serverUrl })
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                continue;
+            }
+            if (Uri.TryCreate(candidate, UriKind.Absolute, out var uri))
+            {
+                return $"{uri.Scheme}://{uri.Authority}";
+            }
+        }
+        return string.Empty;
+    }
+
+    public void ExecuteLocalExitManagementAndRestart(string reason)
+    {
+        if (_remoteExitInProgress)
+        {
+            return;
+        }
+        _remoteExitInProgress = true;
+
+        try
+        {
+            _logger.LogWarning("正在执行远程集控解绑退出并重启（原因：{Reason}）...", reason);
+
+            _managementService.Settings.IsManagementEnabled = false;
+            _managementService.Settings.ManagementServer = string.Empty;
+            _managementService.Settings.ManagementServerGrpc = string.Empty;
+            _managementService.Settings.ManifestUrlTemplate = string.Empty;
+
+            ConfigureFileHelper.SaveConfig(HostRuntimeBridge.ManagementSettingsPath, _managementService.Settings);
+
+            string[] filesToClean =
+            [
+                HostRuntimeBridge.ManagementManifestPath,
+                HostRuntimeBridge.ManagementPolicyPath,
+                HostRuntimeBridge.ManagementCredentialsPath,
+                HostRuntimeBridge.ManagementComponentsPath,
+                HostRuntimeBridge.ServerPublicKeyPath,
+                Path.Combine(HostRuntimeBridge.ManagementConfigureFolderPath, "Versions.json"),
+                Path.Combine(HostRuntimeBridge.ManagementConfigureFolderPath, "DefaultSettings.json"),
+                Path.Combine(CommonDirectories.AppDataFolderPath, "Profiles", "_management-profile.json")
+            ];
+
+            foreach (var file in filesToClean)
+            {
+                try
+                {
+                    if (File.Exists(file))
+                    {
+                        File.Delete(file);
+                    }
+                }
+                catch
+                {
+                    // Ignore
+                }
+            }
+
+            HostRuntimeBridge.MarkServerAsVerifiedMiniServer(
+                serverUrl: string.Empty,
+                verified: false,
+                serverFlavor: string.Empty,
+                clientDisplayName: string.Empty,
+                clientIdentity: string.Empty);
+
+            _configStore.SetAppLockState(false);
+
+            Dispatcher.UIThread.Post(() =>
+            {
+                try
+                {
+                    AppBase.Current.Restart();
+                }
+                catch
+                {
+                    Environment.Exit(0);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "执行远程退出集控并重启时发生异常。");
+            Dispatcher.UIThread.Post(() => AppBase.Current.Restart());
+        }
     }
 
     private string DecorateManagementUrl(string templateUrl)
@@ -343,6 +696,7 @@ public sealed class NetworkRoamingCoordinator : IDisposable
                     // Ignore
                 }
             }
+            ctsProp?.SetValue(conn, new CancellationTokenSource());
 
             if (timerProp?.GetValue(conn) is DispatcherTimer aliveTimer)
             {
@@ -423,6 +777,10 @@ public sealed class NetworkRoamingCoordinator : IDisposable
             return;
         }
         _disposed = true;
+        if (_managementService.Settings is INotifyPropertyChanged npc)
+        {
+            npc.PropertyChanged -= OnManagementSettingsPropertyChanged;
+        }
         NetworkChange.NetworkAddressChanged -= OnNetworkAddressChanged;
         NetworkChange.NetworkAvailabilityChanged -= OnNetworkAvailabilityChanged;
         _roamingReconnectCts?.Cancel();

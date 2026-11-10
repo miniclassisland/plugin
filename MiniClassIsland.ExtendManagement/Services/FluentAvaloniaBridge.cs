@@ -16,14 +16,23 @@ namespace MiniClassIsland.ExtendManagement.Services;
 public static class FluentAvaloniaBridge
 {
     private static Assembly? _faAssembly;
+    private static Assembly? _ciCoreAssembly;
     private static Type? _settingsExpanderType;
     private static Type? _settingsExpanderItemType;
     private static Type? _infoBarType;
     private static Type? _infoBarSeverityType;
+    private static Type? _nativeFieldType;
 
     private static Assembly? FluentAvaloniaAssembly =>
         _faAssembly ??= AppDomain.CurrentDomain.GetAssemblies()
             .FirstOrDefault(a => string.Equals(a.GetName().Name, "FluentAvalonia", StringComparison.OrdinalIgnoreCase));
+
+    private static Assembly? ClassIslandCoreAssembly =>
+        _ciCoreAssembly ??= AppDomain.CurrentDomain.GetAssemblies()
+            .FirstOrDefault(a => string.Equals(a.GetName().Name, "ClassIsland.Core", StringComparison.OrdinalIgnoreCase));
+
+    private static Type? NativeFieldType =>
+        _nativeFieldType ??= ClassIslandCoreAssembly?.GetType("ClassIsland.Core.Controls.Field", throwOnError: false);
 
     private static Type? SettingsExpanderType =>
         _settingsExpanderType ??= ResolveFluentType("FluentAvalonia.UI.Controls.FASettingsExpander", "FluentAvalonia.UI.Controls.SettingsExpander");
@@ -88,6 +97,50 @@ public static class FluentAvaloniaBridge
                 }
             }
         };
+    }
+
+    /// <summary>
+    /// 创建原生 ClassIsland.Core.Controls.Field 表单项控件，确保与主应用表单项风格 100% 一致。
+    /// </summary>
+    public static Control CreateNativeField(
+        string label,
+        Control content,
+        string? suffix = null,
+        Thickness? margin = null)
+    {
+        var type = NativeFieldType;
+        if (type != null && Activator.CreateInstance(type) is Control field)
+        {
+            SetProperty(field, "Label", label);
+            SetProperty(field, "Content", content);
+            if (!string.IsNullOrWhiteSpace(suffix))
+            {
+                SetProperty(field, "Suffix", suffix);
+            }
+            if (margin.HasValue)
+            {
+                field.Margin = margin.Value;
+            }
+            return field;
+        }
+
+        // Fallback Grid matching Field layout
+        var grid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("Auto,*"),
+            ColumnSpacing = 8,
+            Margin = margin ?? new Thickness(0, 8, 0, 0)
+        };
+        var labelTb = new TextBlock
+        {
+            Text = label,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(labelTb, 0);
+        Grid.SetColumn(content, 1);
+        grid.Children.Add(labelTb);
+        grid.Children.Add(content);
+        return grid;
     }
 
     /// <summary>

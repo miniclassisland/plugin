@@ -90,7 +90,15 @@ public sealed class PolicyIntegrityMonitor : IDisposable
         {
             if (File.Exists(path))
             {
-                _protectedFilesSnapshot[path] = File.ReadAllBytes(path);
+                var bytes = File.ReadAllBytes(path);
+                if (string.Equals(path, HostRuntimeBridge.ServerPublicKeyPath, StringComparison.OrdinalIgnoreCase) &&
+                    bytes is [0xEF, 0xBB, 0xBF, ..])
+                {
+                    bytes = bytes[3..];
+                    File.WriteAllBytes(path, bytes);
+                    _logger.LogInformation("已自动清理 ServerKey.asc 头部 UTF-8 BOM 字节。");
+                }
+                _protectedFilesSnapshot[path] = bytes;
             }
         }
         catch
